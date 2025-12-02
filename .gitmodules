@@ -1,0 +1,3 @@
+[submodule "src/cell_segmentation/QCA_Net"]
+	path = src/cell_segmentation/QCA_Net
+	url = https://github.com/funalab/QCANet
