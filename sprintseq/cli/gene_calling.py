@@ -289,24 +289,12 @@ def run_pipeline(run_id=None, ref_file=None, seq_cycle=None, channels=None):
         raise ValueError("ref_file is required and cannot be None")
 
     ref_file = Path(ref_file)
-    if seq_cycle is None:
-        seq_cycle = SEQ_CYCLE
-    if channels is None:
-        channels = CHANNELS
+    seq_cycle = SEQ_CYCLE if seq_cycle is None else seq_cycle
+    channels = list(CHANNELS) if channels is None else list(channels)
     
-    # Build structured paths based on RUN_ID
     dest_dir = BASE_DIR / f'{run_id}_processed'
-    registered_dir = dest_dir / 'registered'
-    stitched_dir = dest_dir / 'stitched'
     read_dir = dest_dir / 'readout'
-    tiles_output_dir = read_dir / 'tiles'
-    matdir = dest_dir / 'TileInfo.mat'
-    
-    # Paths for offset file
-    # Try registered_bspline_torch first, then fall back to registered directory
-    offset_file = registered_dir / 'offsets.csv'
-    
-    
+
     # Load complete intensity produced by readout (position.csv + intensity.csv, already deduplicated)
     position_output = read_dir / 'position.csv'
     intensity_output = read_dir / 'intensity.csv'
@@ -621,12 +609,9 @@ def run_pipeline(run_id=None, ref_file=None, seq_cycle=None, channels=None):
     print("=" * 80)
 
 
-def _parse_channels(value):
-    return [c.strip() for c in str(value).split(',') if c.strip()] if value else None
-
-
 def main():
     """`python -m sprintseq.cli.gene_calling` fallback entry point. The canonical CLI is `sprintseq gene-calling` (see sprintseq.cli.main)."""
+    from sprintseq.cli import parse_channels
     parser = argparse.ArgumentParser(description='Gene calling pipeline for SPRINTseq')
     parser.add_argument('--run-id', type=str, required=True,
                         help='Run ID to process (e.g., "20251211_ZCH_BZ29_TNBC_marker_test1")')
@@ -634,7 +619,7 @@ def main():
                         help='Path to reference codebook file (e.g., CSV file with gene barcodes)')
     parser.add_argument('--seq-cycles', type=int, default=None,
                         help=f'Number of sequencing cycles to decode. Default: {SEQ_CYCLE}')
-    parser.add_argument('--channels', type=_parse_channels, default=None,
+    parser.add_argument('--channels', type=parse_channels, default=None,
                         help=f'Comma-separated SBS channels. Default: {",".join(CHANNELS)}')
     args = parser.parse_args()
     run_pipeline(run_id=args.run_id, ref_file=args.ref_file,
