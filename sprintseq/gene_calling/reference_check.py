@@ -31,14 +31,16 @@ def read_ref_list(filename,require_dict=True):
     else:
         return list(df['Barcode'])
 
-def check_sequence(seq_file,ref_file):
+def check_sequence(seq_file, ref_file, verbose=True):
     ref = pd.read_csv(ref_file)
     barcodes = list(ref['Barcode'])
     df = pd.read_csv(seq_file)
     df = filter_by_count(df)
-    print(f'Reads filtered by count: {len(df)}.')
-    df = reference_check(df,barcodes)
-    print(f'Reads reference checked: {len(df)}.')
+    if verbose:
+        print(f'Reads filtered by count: {len(df)}.')
+    df = reference_check(df, barcodes)
+    if verbose:
+        print(f'Reads reference checked: {len(df)}.')
     return df
 
 def main():

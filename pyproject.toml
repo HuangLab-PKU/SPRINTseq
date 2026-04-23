@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sprintseq"
+version = "0.1.0"
+description = "Official analysis pipeline for SPRINTseq (Chang et al., PNAS 2023, doi:10.1073/pnas.2309227120) — post-stitched spot detection, gene calling, density maps, and cell segmentation."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "HuangLab-PKU" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+# Baseline dependencies. CPU-only installs can run the DoG+tophat spot-detection
+# fallback and the threshold / intensity-direct gene-calling methods without any
+# deep-learning components.
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "scikit-image",
+    "opencv-python",
+    "tifffile",
+    "tqdm",
+    "PyYAML",
+    "matplotlib",
+    "seaborn",
+]
+
+# Optional DL extras. Only `spotiflow` and `cellpose` exist on PyPI under these
+# exact names, so only they are safely installable via `pip install sprintseq[...]`.
+# `cellSAM` and `postcode` (the HuangLab fork) are NOT on PyPI — install them
+# as editable packages from the vendored trees:
+#
+#     pip install -e <SPRINTseq>/experiments/src/postcode
+#     pip install -e <SPRINTseq>/experiments/src/cellsam
+#
+# See common_failures.md in the sprintseq-pipeline skill for the full install order.
+[project.optional-dependencies]
+detection-dl = ["spotiflow"]
+cellpose     = ["cellpose"]
+test         = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/HuangLab-PKU/SPRINTseq"
+Repository = "https://github.com/HuangLab-PKU/SPRINTseq"
+
+# Single console entry point: `sprintseq <subcommand> [options]`.
+# Run `sprintseq --help` for the subcommand list, or `sprintseq <sub> --help` for per-sub options.
+[project.scripts]
+sprintseq = "sprintseq.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["sprintseq*"]
