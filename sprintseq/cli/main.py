@@ -1,0 +1,278 @@
+"""Unified CLI entry point for the sprintseq package.
+
+Usage:
+    sprintseq <subcommand> [options]
+
+Subcommands:
+    readout         Spot detection + intensity readout from stitched images.
+    gene-calling    Intensity correction (optional) + gene mapping.
+    density         Per-gene downsampled density TIFFs.
+    segment         Cell segmentation + RNA-to-cell assignment.
+
+Run `sprintseq <subcommand> --help` for details on each.
+"""
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+# Re-use module-level defaults and run_pipeline helpers from each CLI module.
+# These imports are lazy where possible to keep --help fast and avoid pulling
+# in heavy deps before the user chooses a subcommand.
+from sprintseq.cli import density as density_mod
+from sprintseq.cli import gene_calling as gc_mod
+from sprintseq.cli import readout as readout_mod
+from sprintseq.cli import segment as segment_mod
+
+
+def _build_readout(sub):
+    p = sub.add_parser(
+        "readout",
+        help="Spot detection + intensity readout from stitched images.",
+        description=(
+            "Stage 1 of the SPRINTseq post-stitched pipeline.\n\n"
+            "Reads cyc_{1..N}_{cy3,cy5}.tif from "
+            r"\\10.10.10.1\NAS Processed Images\<RUN_ID>_processed\stitched\, "
+            "runs block-parallel spot detection (Spotiflow by default, DoG+tophat fallback), "
+            "extracts tophat-corrected intensities, deduplicates across block overlaps, and writes "
+            "readout/position.csv + readout/intensity.csv.\n\n"
+            "Defaults (edit in sprintseq/cli/readout.py if every run truly needs different values): "
+            f"CYCLE_NUM={readout_mod.CYCLE_NUM} detection cycles, "
+            f"SEQ_CYCLE={readout_mod.SEQ_CYCLE} sequencing cycles, "
+            f"CHANNELS={readout_mod.CHANNELS}, "
+            f"SNRS={readout_mod.SNRS}, "
+            f"DETECTION_METHOD={readout_mod.DETECTION_METHOD!r}, "
+            f"BLOCK_SIZE={readout_mod.BLOCK_SIZE}, BLOCK_OVERLAP={readout_mod.BLOCK_OVERLAP}, "
+            f"MIN_INTENSITY_THRESHOLD={readout_mod.MIN_INTENSITY_THRESHOLD}, "
+            f"DEDUPLICATE_THRESHOLD={readout_mod.DEDUPLICATE_THRESHOLD}."
+        ),
+        epilog="Example: sprintseq readout --run-id 20260420_ZCH_BZ29_Ca_TNBC_marker_4 --n-workers 4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--run-id", type=str, default=readout_mod.DEFAULT_RUN_ID,
+        help=f"Run identifier; used to locate <base>/<RUN_ID>_processed/stitched/. "
+             f"(default: {readout_mod.DEFAULT_RUN_ID})",
+    )
+    p.add_argument(
+        "--n-workers", type=int, default=None,
+        help=f"Process-pool size for block-parallel detection and intensity readout. "
+             f"(default: {readout_mod.N_WORKERS})",
+    )
+    p.set_defaults(_func=_run_readout)
+
+
+def _run_readout(args):
+    # File logging to readout.log in the run's readout dir
+    read_dir = Path(readout_mod.BASE_DEST_DIRECTORY) / f"{args.run_id}_processed" / "readout"
+    read_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.FileHandler(read_dir / "readout.log", encoding="utf-8")
+    fh.setFormatter(logging.Formatter(readout_mod._LOG_FMT))
+    logging.getLogger().addHandler(fh)
+    readout_mod.run_pipeline(args.run_id, n_workers=args.n_workers)
+
+
+def _build_gene_calling(sub):
+    p = sub.add_parser(
+        "gene-calling",
+        help="Intensity correction (optional) + gene mapping.",
+        description=(
+            "Stage 2 of the SPRINTseq post-stitched pipeline.\n\n"
+            "Reads readout/position.csv + readout/intensity.csv, applies global intensity "
+            "correction (channel balance, signal decay, phasing) only if non-postcode methods "
+            "are enabled (postcode handles these internally), then runs gene mapping against "
+            "the supplied codebook. Writes readout/mapping_<method>.csv, "
+            "readout/global_correction_info.json, readout/convergence_<method>.png, and "
+            "readout/mapping_qc_<method>.png.\n\n"
+            "Default method is 'postcode' (requires the vendored postcode package + torch + pyro). "
+            "Alternatives documented in sprintseq/cli/gene_calling.py include 'threshold' "
+            "(classical Hamming<=1 match) and 'intensity_direct' / 'per_round_max' "
+            "(starfish-style similarity)."
+        ),
+        epilog="Example: sprintseq gene-calling --run-id 20260420_... --ref-file codebook/ZCH_TNBC_marker_genes.csv",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--run-id", type=str, required=True,
+        help="Run identifier; reads readout/position.csv + readout/intensity.csv under this run's processed dir.",
+    )
+    p.add_argument(
+        "--ref-file", type=str, required=True,
+        help="Path to codebook CSV (columns: Barcode, Gene). Gene field may contain '+'-separated plex entries.",
+    )
+    p.set_defaults(_func=_run_gene_calling)
+
+
+def _run_gene_calling(args):
+    gc_mod.run_pipeline(run_id=args.run_id, ref_file=args.ref_file)
+
+
+def _build_density(sub):
+    p = sub.add_parser(
+        "density",
+        help="Per-gene downsampled density TIFFs from postcode mapping.",
+        description=(
+            "Stage 3 of the SPRINTseq post-stitched pipeline.\n\n"
+            "Reads readout/mapping_postcode.csv and readout/position.csv, filters by "
+            "probability >= threshold, uses a vectorised bincount to produce a "
+            "per-gene cube, and writes one <gene>.tif per gene into readout/density/. "
+            "Output resolution is (H/fac, W/fac)."
+        ),
+        epilog="Example: sprintseq density --run-id 20260420_... --threshold 0.9 --fac 100",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--run-id", type=str, required=True,
+        help="Run identifier.",
+    )
+    p.add_argument(
+        "--threshold", type=float, default=density_mod.DEFAULT_THRESHOLD,
+        help=f"Minimum postcode Probability for a spot to be counted. "
+             f"(default: {density_mod.DEFAULT_THRESHOLD})",
+    )
+    p.add_argument(
+        "--fac", type=int, default=density_mod.DEFAULT_FAC,
+        help=f"Downsample factor; output resolution is (H/fac, W/fac). "
+             f"(default: {density_mod.DEFAULT_FAC})",
+    )
+    p.set_defaults(_func=_run_density)
+
+
+def _run_density(args):
+    density_mod.run_pipeline(args.run_id, threshold=args.threshold, fac=args.fac)
+
+
+def _build_segment(sub):
+    p = sub.add_parser(
+        "segment",
+        help="Cell segmentation + RNA-to-cell assignment.",
+        description=(
+            "Stage 4 of the SPRINTseq pipeline (run after gene-calling).\n\n"
+            "Loads high-confidence spots from readout/mapping_postcode.csv, segments cells from "
+            "stitched DAPI + optional morphology channels, and writes "
+            "segmented/{mask.tif, cell_positions.csv, assigned_spots.csv, cell_gene_matrix.csv}.\n\n"
+            "Methods:\n"
+            "  auto           (default) nuclei-kdtree if no morphology is given AND none is auto-\n"
+            "                 detected under stitched/; cellsam otherwise.\n"
+            "  cellsam        DAPI + morphology channels → CellSAM → cell masks → spot-to-cell by mask.\n"
+            "  cellpose       DAPI + morphology channels → Cellpose → cell masks → spot-to-cell by mask.\n"
+            "  nuclei-kdtree  DAPI only → cellSAM nucleus segmentation → centroids → KD-tree:\n"
+            "                 each spot attributed to its nearest nucleus centroid.\n\n"
+            "IMPORTANT: the CellSAM / Cellpose model is a user-validated choice per tissue and panel. "
+            "If --model is omitted, the backend default is used and a warning is logged — prefer to pass "
+            "the model name your lab has validated for this panel."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  # Auto-detect everything (FAM under stitched/ → cellsam; else → nuclei-kdtree):\n"
+            "  sprintseq segment --run-id 20260420_ZCH_BZ29_Ca_TNBC_marker_4 --model cellsam_general\n\n"
+            "  # Explicit DAPI + two morphology channels (e.g. FAM + WGA):\n"
+            "  sprintseq segment --run-id <id> --method cellsam --model my_finetuned_v3 \\\n"
+            "      --dapi stitched/cyc_11_DAPI.tif \\\n"
+            "      --morphology stitched/cyc_11_FAM.tif --morphology stitched/cyc_11_WGA.tif\n\n"
+            "  # Force nucleus-only + KD-tree (no morphology available):\n"
+            "  sprintseq segment --run-id <id> --method nuclei-kdtree --kdtree-max-distance 40"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--run-id", type=str, required=True,
+        help="Run identifier; reads stitched/ and readout/ under this run's processed dir.",
+    )
+    p.add_argument(
+        "--dapi", type=str, default=None,
+        help="DAPI image path. Auto-detected from stitched/cyc_{11,1}_DAPI.tif if omitted.",
+    )
+    p.add_argument(
+        "--morphology", action="append", default=None,
+        help="Morphology (cytoplasm / membrane / cell-body) channel image. "
+             "Repeat for multiple channels (they get merged via pixel-wise max). "
+             "If omitted, tries to auto-detect cyc_*_FAM.tif; "
+             "if still empty AND --method=auto, falls back to nuclei-kdtree.",
+    )
+    p.add_argument(
+        "--method", default=segment_mod.DEFAULT_METHOD,
+        choices=["auto", "cellsam", "cellpose", "nuclei-kdtree"],
+        help=f"Segmentation method. (default: {segment_mod.DEFAULT_METHOD})",
+    )
+    p.add_argument(
+        "--model", type=str, default=None,
+        help="Backend model name. Strongly recommended — do not rely on defaults "
+             "unless that's the one your lab has validated for this panel.",
+    )
+    p.add_argument(
+        "--prob", type=float, default=segment_mod.DEFAULT_PROB,
+        help=f"Postcode probability threshold for including a spot. "
+             f"(default: {segment_mod.DEFAULT_PROB})",
+    )
+    p.add_argument(
+        "--block-size", type=int, default=segment_mod.DEFAULT_BLOCK_SIZE,
+        help=f"Tile size for block-parallel segmentation. (default: {segment_mod.DEFAULT_BLOCK_SIZE})",
+    )
+    p.add_argument(
+        "--overlap", type=int, default=segment_mod.DEFAULT_OVERLAP,
+        help=f"Tile overlap in pixels. (default: {segment_mod.DEFAULT_OVERLAP})",
+    )
+    p.add_argument(
+        "--kdtree-max-distance", type=float, default=segment_mod.DEFAULT_KDTREE_MAX_DISTANCE,
+        help="(nuclei-kdtree only) Pixel radius beyond which a spot is considered unassigned. "
+             "None = no cap.",
+    )
+    p.set_defaults(_func=_run_segment)
+
+
+def _run_segment(args):
+    segment_mod.run_pipeline(
+        run_id=args.run_id, dapi=args.dapi, morphology=args.morphology,
+        method=args.method, model=args.model, prob_threshold=args.prob,
+        block_size=args.block_size, overlap=args.overlap,
+        kdtree_max_distance=args.kdtree_max_distance,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="sprintseq",
+        description=(
+            "SPRINTseq post-stitched analysis pipeline.\n\n"
+            "Run `sprintseq <subcommand> --help` for per-subcommand options. "
+            "For the full pipeline, use the PowerShell orchestrator "
+            "experiments/run_pipeline.ps1 -RunId <id> -RefFile <codebook.csv>."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Subcommands:\n"
+            "  readout         Spot detection + intensity readout.\n"
+            "  gene-calling    Gene mapping (postcode / threshold / ...).\n"
+            "  density         Per-gene density TIFFs.\n"
+            "  segment         Cell segmentation + RNA-to-cell assignment.\n\n"
+            "Example end-to-end:\n"
+            "  sprintseq readout       --run-id <id>\n"
+            "  sprintseq gene-calling  --run-id <id> --ref-file <codebook.csv>\n"
+            "  sprintseq density       --run-id <id>\n"
+            "  sprintseq segment       --run-id <id> --model <validated-model>\n"
+        ),
+    )
+    sub = parser.add_subparsers(dest="command",
+                                metavar="{readout,gene-calling,density,segment}")
+
+    _build_readout(sub)
+    _build_gene_calling(sub)
+    _build_density(sub)
+    _build_segment(sub)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Root logger: keep INFO + timestamp format for all subcommands
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    args._func(args)
+
+
+if __name__ == "__main__":
+    main()
