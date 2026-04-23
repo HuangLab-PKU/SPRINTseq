@@ -8,7 +8,7 @@ This repository hosts the **post-stitched** side of the pipeline: spot detection
 
 If you use SPRINTseq in your work, please cite:
 
-> Chang Y., Chakiryan N. H., Dhawan A., Gonzalez B., Du D., Amacher R. K., Hartman T., Liao R., Osipov V., Shain A. H., Wallace D., Ferrari M., & Huang Y. (2023). *Rapid and signal crowdedness-robust in situ sequencing through hybrid block coding.* Proceedings of the National Academy of Sciences, 120(47): e2309227120.
+> Chang et al. (2023). *Rapid and signal crowdedness-robust in situ sequencing through hybrid block coding.* Proceedings of the National Academy of Sciences, 120(47): e2309227120.
 >
 > - DOI: <https://doi.org/10.1073/pnas.2309227120>
 > - PNAS: <https://www.pnas.org/doi/10.1073/pnas.2309227120>
@@ -55,11 +55,13 @@ After install a single `sprintseq` command is on `PATH`, dispatching four subcom
 
 ```powershell
 sprintseq --help                                                              # subcommand list
-sprintseq readout       --run-id <RUN_ID> [--n-workers 4]
-sprintseq gene-calling  --run-id <RUN_ID> --ref-file <codebook.csv>
+sprintseq readout       --run-id <RUN_ID> [--detection-cycles 1-4,11] [--seq-cycles 10] [--channels cy3,cy5] [--n-workers 4]
+sprintseq gene-calling  --run-id <RUN_ID> --ref-file <codebook.csv> [--seq-cycles 10] [--channels cy3,cy5]
 sprintseq density       --run-id <RUN_ID> [--threshold 0.95] [--fac 200]
-sprintseq segment       --run-id <RUN_ID> [--morphology <file>]... [--model <name>] [--method {auto,cellsam,cellpose,nuclei-kdtree}]
+sprintseq segment       --run-id <RUN_ID> [--dapi <path>] [--morphology <file>]... [--model <name>] [--method {auto,cellsam,cellpose,nuclei-kdtree}]
 ```
+
+Channel semantics: `--channels cy3,cy5` are the **SBS spot channels** — used for both detection and intensity readout. `--detection-cycles` accepts an explicit list (e.g. `11` for a total-spot staining cycle, `1-4,11` to union classic + total-spot). The `--dapi` / `--morphology` flags on `segment` are separate — morphology is any cell-body marker (FAM, CellMask, WGA, etc.), not required to be FAM. Large-image reads go through `tifffile.memmap` throughout (detection, intensity readout, segmentation prep), so only the active tile is paged into RAM even for 30k × 30k stitched images.
 
 Each subcommand's `--help` prints a stage description, current defaults, and an example invocation.
 

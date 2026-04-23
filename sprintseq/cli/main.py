@@ -36,9 +36,9 @@ def _build_readout(sub):
             "runs block-parallel spot detection (Spotiflow by default, DoG+tophat fallback), "
             "extracts tophat-corrected intensities, deduplicates across block overlaps, and writes "
             "readout/position.csv + readout/intensity.csv.\n\n"
-            "Defaults (edit in sprintseq/cli/readout.py if every run truly needs different values): "
-            f"CYCLE_NUM={readout_mod.CYCLE_NUM} detection cycles, "
-            f"SEQ_CYCLE={readout_mod.SEQ_CYCLE} sequencing cycles, "
+            "Defaults (override via flags — edit sprintseq/cli/readout.py to change globally): "
+            f"DETECTION_CYCLES={readout_mod.DETECTION_CYCLES}, "
+            f"SEQ_CYCLE={readout_mod.SEQ_CYCLE} sequencing cycles (always consecutive 1..N), "
             f"CHANNELS={readout_mod.CHANNELS}, "
             f"SNRS={readout_mod.SNRS}, "
             f"DETECTION_METHOD={readout_mod.DETECTION_METHOD!r}, "
@@ -46,7 +46,15 @@ def _build_readout(sub):
             f"MIN_INTENSITY_THRESHOLD={readout_mod.MIN_INTENSITY_THRESHOLD}, "
             f"DEDUPLICATE_THRESHOLD={readout_mod.DEDUPLICATE_THRESHOLD}."
         ),
-        epilog="Example: sprintseq readout --run-id 20260420_ZCH_BZ29_Ca_TNBC_marker_4 --n-workers 4",
+        epilog=(
+            "Examples:\n"
+            "  # Classic: detect on cyc_1..4\n"
+            "  sprintseq readout --run-id <id>\n\n"
+            "  # Total-spot protocol: one dedicated cycle stains every spot\n"
+            "  sprintseq readout --run-id <id> --detection-cycles 11\n\n"
+            "  # Union both strategies for max recall; also override SBS channels\n"
+            "  sprintseq readout --run-id <id> --detection-cycles 1-4,11 --channels cy3,cy5\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
@@ -59,6 +67,22 @@ def _build_readout(sub):
         help=f"Process-pool size for block-parallel detection and intensity readout. "
              f"(default: {readout_mod.N_WORKERS})",
     )
+    p.add_argument(
+        "--detection-cycles", type=readout_mod.parse_cycles, default=None,
+        help=f"Explicit list of cycles to detect spots in. Accepts comma-separated "
+             f"integers and ranges, e.g. '1,2,3,4', '11', '1-4,11'. "
+             f"(default: {readout_mod.DETECTION_CYCLES})",
+    )
+    p.add_argument(
+        "--seq-cycles", type=int, default=None,
+        help=f"Number of sequencing cycles (consecutive 1..N) read for intensity. "
+             f"(default: {readout_mod.SEQ_CYCLE})",
+    )
+    p.add_argument(
+        "--channels", type=readout_mod.parse_channels, default=None,
+        help=f"Comma-separated SBS spot channels, used for BOTH detection and intensity. "
+             f"(default: {','.join(readout_mod.CHANNELS)})",
+    )
     p.set_defaults(_func=_run_readout)
 
 
@@ -69,7 +93,13 @@ def _run_readout(args):
     fh = logging.FileHandler(read_dir / "readout.log", encoding="utf-8")
     fh.setFormatter(logging.Formatter(readout_mod._LOG_FMT))
     logging.getLogger().addHandler(fh)
-    readout_mod.run_pipeline(args.run_id, n_workers=args.n_workers)
+    readout_mod.run_pipeline(
+        args.run_id,
+        n_workers=args.n_workers,
+        detection_cycles=args.detection_cycles,
+        seq_cycle=args.seq_cycles,
+        channels=args.channels,
+    )
 
 
 def _build_gene_calling(sub):
@@ -100,11 +130,24 @@ def _build_gene_calling(sub):
         "--ref-file", type=str, required=True,
         help="Path to codebook CSV (columns: Barcode, Gene). Gene field may contain '+'-separated plex entries.",
     )
+    p.add_argument(
+        "--seq-cycles", type=int, default=None,
+        help=f"Number of sequencing cycles to decode (matches readout's --seq-cycles). "
+             f"(default: {gc_mod.SEQ_CYCLE})",
+    )
+    p.add_argument(
+        "--channels", type=gc_mod._parse_channels, default=None,
+        help=f"Comma-separated SBS channels (matches readout's --channels). "
+             f"(default: {','.join(gc_mod.CHANNELS)})",
+    )
     p.set_defaults(_func=_run_gene_calling)
 
 
 def _run_gene_calling(args):
-    gc_mod.run_pipeline(run_id=args.run_id, ref_file=args.ref_file)
+    gc_mod.run_pipeline(
+        run_id=args.run_id, ref_file=args.ref_file,
+        seq_cycle=args.seq_cycles, channels=args.channels,
+    )
 
 
 def _build_density(sub):

@@ -43,15 +43,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_RUN_ID = 'example_dataset'
 
 BASE_DEST_DIRECTORY = r'\\10.10.10.1\NAS Processed Images'
-CHANNELS = ['cy3', 'cy5']
+CHANNELS = ['cy3', 'cy5']                    # SBS spot channels (both detection and intensity)
 
-# Spot detection
-CYCLE_NUM = 4           # Cycles used for detection (cyc_1..CYCLE_NUM)
+# Spot detection — pass an explicit list of cycles to detect in. Typical choices:
+#   [1, 2, 3, 4]   classic: detect on first 4 sequencing cycles, union across channels
+#   [11]           total-spot: single dedicated cycle where every spot is labelled
+#   [1, 2, 3, 4, 11]  both strategies combined for maximum recall
+DETECTION_CYCLES = [1, 2, 3, 4]
 SNRS = {'cy3': 3.0, 'cy5': 3.0}
 DETECTION_METHOD = 'spotiflow'
 
-# Intensity readout
-SEQ_CYCLE = 10          # Cycles used for intensity (cyc_1..SEQ_CYCLE)
+# Intensity readout — sequencing cycles are consecutive 1..SEQ_CYCLE
+SEQ_CYCLE = 10
 TOPHAT_RADIUS = 3
 SEARCH_RADIUS = 1
 MIN_INTENSITY_THRESHOLD = 50
@@ -113,7 +116,7 @@ def _get_stitched_image_path(stc_dir, cyc, channel):
 def detect_all_spots(
     stc_dir,
     channels=CHANNELS,
-    cycle_num=CYCLE_NUM,
+    detection_cycles=None,
     block_size=BLOCK_SIZE,
     block_overlap=BLOCK_OVERLAP,
     detection_method=DETECTION_METHOD,
@@ -122,12 +125,19 @@ def detect_all_spots(
 ):
     """Stage 1: Detect spots across detection cycles/channels from stitched images.
 
-    For each detection image (cyc_1..cycle_num x channels):
+    For each detection image (cycle x channel from detection_cycles x channels):
       - Open tifffile.memmap
       - Generate blocks via block_starts()
       - Submit blocks to ProcessPoolExecutor
       - Accumulate global coordinates
     Combine all coordinates, remove exact duplicates.
+
+    Parameters
+    ----------
+    detection_cycles : list[int] | None
+        Explicit list of cycle numbers to detect in. Defaults to `DETECTION_CYCLES`
+        (= [1, 2, 3, 4]). Use e.g. `[11]` when your protocol stains every spot in a
+        single dedicated cycle, or `[1, 2, 3, 4, 11]` to union both strategies.
 
     Returns
     -------
@@ -136,10 +146,12 @@ def detect_all_spots(
     """
     stc_dir = Path(stc_dir)
     by, bx = block_size
+    if detection_cycles is None:
+        detection_cycles = DETECTION_CYCLES
 
     # Count total blocks for progress bar
     n_total_blocks = 0
-    for cyc in range(1, cycle_num + 1):
+    for cyc in detection_cycles:
         for channel in channels:
             img_path = _get_stitched_image_path(stc_dir, cyc, channel)
             if not img_path.exists():
@@ -159,7 +171,7 @@ def detect_all_spots(
 
     # Lazy iterator: open memmap per image, yield blocks as numpy arrays
     def _detection_task_iter():
-        for cyc in range(1, cycle_num + 1):
+        for cyc in detection_cycles:
             for channel in channels:
                 img_path = _get_stitched_image_path(stc_dir, cyc, channel)
                 if not img_path.exists():
@@ -351,18 +363,35 @@ def read_all_intensities(
     return intensity_df
 
 
-def run_pipeline(run_id, n_workers=None):
+def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
+                 channels=None):
     """Main entry point for stitched-image readout pipeline.
 
     Parameters
     ----------
     run_id : str
-        Run identifier (e.g., '20251128_ZCH_BZ09_Re2_mut_new')
+        Run identifier (e.g., '20251128_ZCH_BZ09_Re2_mut_new').
     n_workers : int, optional
-        Number of parallel workers. If None, uses N_WORKERS default.
+        Number of parallel workers. Defaults to N_WORKERS.
+    detection_cycles : list[int], optional
+        Cycles to run spot detection on. Defaults to DETECTION_CYCLES (=[1,2,3,4]).
+        Pass a single-element list (e.g. [11]) if your protocol labels every spot
+        in one dedicated cycle, or combine strategies by union (e.g. [1,2,3,4,11]).
+    seq_cycle : int, optional
+        Number of sequencing cycles (always consecutive 1..seq_cycle) used for
+        intensity readout. Defaults to SEQ_CYCLE.
+    channels : list[str], optional
+        SBS spot channels. Defaults to CHANNELS (['cy3','cy5']). Used for both
+        detection and intensity readout.
     """
     if n_workers is None:
         n_workers = N_WORKERS
+    if detection_cycles is None:
+        detection_cycles = DETECTION_CYCLES
+    if seq_cycle is None:
+        seq_cycle = SEQ_CYCLE
+    if channels is None:
+        channels = CHANNELS
 
     dest_dir = Path(BASE_DEST_DIRECTORY) / f'{run_id}_processed'
     stc_dir = dest_dir / 'stitched'
@@ -379,8 +408,9 @@ def run_pipeline(run_id, n_workers=None):
     logger.info(f"Run ID: {run_id}")
     logger.info(f"Stitched dir: {stc_dir}")
     logger.info(f"Output dir: {read_dir}")
-    logger.info(f"Detection: {DETECTION_METHOD}, cycles 1-{CYCLE_NUM}")
-    logger.info(f"Intensity: tophat (radius={TOPHAT_RADIUS}, search={SEARCH_RADIUS}), cycles 1-{SEQ_CYCLE}")
+    logger.info(f"Detection: {DETECTION_METHOD}, cycles {detection_cycles}, channels {channels}")
+    logger.info(f"Intensity: tophat (radius={TOPHAT_RADIUS}, search={SEARCH_RADIUS}), "
+                f"cycles 1-{seq_cycle}, channels {channels}")
     logger.info(f"Block size: {BLOCK_SIZE}, overlap: {BLOCK_OVERLAP}")
     logger.info(f"Workers: {n_workers}")
     logger.info("=" * 80)
@@ -391,8 +421,8 @@ def run_pipeline(run_id, n_workers=None):
     logger.info("=" * 80)
     unique_coords = detect_all_spots(
         stc_dir,
-        channels=CHANNELS,
-        cycle_num=CYCLE_NUM,
+        channels=channels,
+        detection_cycles=detection_cycles,
         block_size=BLOCK_SIZE,
         block_overlap=BLOCK_OVERLAP,
         detection_method=DETECTION_METHOD,
@@ -410,8 +440,8 @@ def run_pipeline(run_id, n_workers=None):
     intensity_df = read_all_intensities(
         stc_dir,
         unique_coords,
-        channels=CHANNELS,
-        seq_cycle=SEQ_CYCLE,
+        channels=channels,
+        seq_cycle=seq_cycle,
         block_size=BLOCK_SIZE,
         block_overlap=BLOCK_OVERLAP,
         tophat_radius=TOPHAT_RADIUS,
@@ -490,6 +520,30 @@ def run_pipeline(run_id, n_workers=None):
     return position_df, intensity_output_df
 
 
+def parse_cycles(value):
+    """Parse comma-separated cycle list '1,2,3,11' → [1,2,3,11]. Also supports ranges '1-4,11' → [1,2,3,4,11]."""
+    if value is None:
+        return None
+    out = []
+    for part in str(value).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            out.extend(range(int(lo), int(hi) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
+def parse_channels(value):
+    """Parse comma-separated channel list 'cy3,cy5' → ['cy3','cy5']."""
+    if value is None:
+        return None
+    return [c.strip() for c in str(value).split(',') if c.strip()]
+
+
 def main():
     """`python -m sprintseq.cli.readout` fallback entry point. The canonical CLI is `sprintseq readout` (see sprintseq.cli.main)."""
     parser = argparse.ArgumentParser(description='Stitched-image readout pipeline for SPRINTseq')
@@ -497,6 +551,14 @@ def main():
                         help=f'Run ID to process (default: {DEFAULT_RUN_ID})')
     parser.add_argument('--n-workers', type=int, default=None,
                         help=f'Number of parallel workers (default: {N_WORKERS})')
+    parser.add_argument('--detection-cycles', type=parse_cycles, default=None,
+                        help=f'Cycles to detect spots in (e.g. "1,2,3,4" or "1-4,11" or "11"). '
+                             f'Default: {DETECTION_CYCLES}')
+    parser.add_argument('--seq-cycles', type=int, default=None,
+                        help=f'Number of sequencing cycles (1..N) for intensity readout. '
+                             f'Default: {SEQ_CYCLE}')
+    parser.add_argument('--channels', type=parse_channels, default=None,
+                        help=f'Comma-separated SBS channels. Default: {",".join(CHANNELS)}')
     args = parser.parse_args()
 
     # Log to file
@@ -506,7 +568,10 @@ def main():
     fh.setFormatter(logging.Formatter(_LOG_FMT))
     logging.getLogger().addHandler(fh)
 
-    run_pipeline(args.run_id, n_workers=args.n_workers)
+    run_pipeline(args.run_id, n_workers=args.n_workers,
+                 detection_cycles=args.detection_cycles,
+                 seq_cycle=args.seq_cycles,
+                 channels=args.channels)
 
 
 if __name__ == "__main__":
