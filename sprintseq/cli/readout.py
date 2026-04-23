@@ -384,14 +384,12 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
         SBS spot channels. Defaults to CHANNELS (['cy3','cy5']). Used for both
         detection and intensity readout.
     """
-    if n_workers is None:
-        n_workers = N_WORKERS
-    if detection_cycles is None:
-        detection_cycles = DETECTION_CYCLES
-    if seq_cycle is None:
-        seq_cycle = SEQ_CYCLE
-    if channels is None:
-        channels = CHANNELS
+    # Copy list defaults so callers can't mutate the module-level state via
+    # the returned reference.
+    n_workers = N_WORKERS if n_workers is None else n_workers
+    detection_cycles = list(DETECTION_CYCLES) if detection_cycles is None else list(detection_cycles)
+    seq_cycle = SEQ_CYCLE if seq_cycle is None else seq_cycle
+    channels = list(CHANNELS) if channels is None else list(channels)
 
     dest_dir = Path(BASE_DEST_DIRECTORY) / f'{run_id}_processed'
     stc_dir = dest_dir / 'stitched'
@@ -520,30 +518,6 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     return position_df, intensity_output_df
 
 
-def parse_cycles(value):
-    """Parse comma-separated cycle list '1,2,3,11' → [1,2,3,11]. Also supports ranges '1-4,11' → [1,2,3,4,11]."""
-    if value is None:
-        return None
-    out = []
-    for part in str(value).split(','):
-        part = part.strip()
-        if not part:
-            continue
-        if '-' in part:
-            lo, hi = part.split('-', 1)
-            out.extend(range(int(lo), int(hi) + 1))
-        else:
-            out.append(int(part))
-    return out
-
-
-def parse_channels(value):
-    """Parse comma-separated channel list 'cy3,cy5' → ['cy3','cy5']."""
-    if value is None:
-        return None
-    return [c.strip() for c in str(value).split(',') if c.strip()]
-
-
 def main():
     """`python -m sprintseq.cli.readout` fallback entry point. The canonical CLI is `sprintseq readout` (see sprintseq.cli.main)."""
     parser = argparse.ArgumentParser(description='Stitched-image readout pipeline for SPRINTseq')
@@ -551,6 +525,7 @@ def main():
                         help=f'Run ID to process (default: {DEFAULT_RUN_ID})')
     parser.add_argument('--n-workers', type=int, default=None,
                         help=f'Number of parallel workers (default: {N_WORKERS})')
+    from sprintseq.cli import parse_cycles, parse_channels
     parser.add_argument('--detection-cycles', type=parse_cycles, default=None,
                         help=f'Cycles to detect spots in (e.g. "1,2,3,4" or "1-4,11" or "11"). '
                              f'Default: {DETECTION_CYCLES}')

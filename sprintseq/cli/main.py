@@ -23,6 +23,7 @@ from sprintseq.cli import density as density_mod
 from sprintseq.cli import gene_calling as gc_mod
 from sprintseq.cli import readout as readout_mod
 from sprintseq.cli import segment as segment_mod
+from sprintseq.cli import parse_cycles, parse_channels
 
 
 def _build_readout(sub):
@@ -68,7 +69,7 @@ def _build_readout(sub):
              f"(default: {readout_mod.N_WORKERS})",
     )
     p.add_argument(
-        "--detection-cycles", type=readout_mod.parse_cycles, default=None,
+        "--detection-cycles", type=parse_cycles, default=None,
         help=f"Explicit list of cycles to detect spots in. Accepts comma-separated "
              f"integers and ranges, e.g. '1,2,3,4', '11', '1-4,11'. "
              f"(default: {readout_mod.DETECTION_CYCLES})",
@@ -79,7 +80,7 @@ def _build_readout(sub):
              f"(default: {readout_mod.SEQ_CYCLE})",
     )
     p.add_argument(
-        "--channels", type=readout_mod.parse_channels, default=None,
+        "--channels", type=parse_channels, default=None,
         help=f"Comma-separated SBS spot channels, used for BOTH detection and intensity. "
              f"(default: {','.join(readout_mod.CHANNELS)})",
     )
@@ -136,7 +137,7 @@ def _build_gene_calling(sub):
              f"(default: {gc_mod.SEQ_CYCLE})",
     )
     p.add_argument(
-        "--channels", type=gc_mod._parse_channels, default=None,
+        "--channels", type=parse_channels, default=None,
         help=f"Comma-separated SBS channels (matches readout's --channels). "
              f"(default: {','.join(gc_mod.CHANNELS)})",
     )

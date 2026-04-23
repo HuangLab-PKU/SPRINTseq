@@ -63,16 +63,20 @@ class _MemmapStack:
         ----------
         reference_shape : tuple (H, W)
         dtype : numpy dtype
-        channel_assignments : list of (out_idx, source)
-            Each entry places `source` into output channel `out_idx`. `source` is one of:
-              * a 2D ndarray / memmap (used directly),
-              * a list of 2D ndarrays / memmaps (combined via pixel-wise max per tile).
+        channel_assignments : list of (out_idx, sources)
+            Each entry places pixel-wise max of `sources` (a list of 2D ndarrays /
+            memmaps) into output channel `out_idx`. A single-source list is fine.
         n_out_channels : int
             Width of the output channel axis (3 for CellSAM, 2 for Cellpose).
         """
         self._ref_shape = reference_shape
         self._dtype = dtype
-        self._assignments = channel_assignments
+        # Normalize: every assignment holds a list (possibly length-1), so __getitem__
+        # doesn't need to branch on single- vs multi-source at hot-path time.
+        self._assignments = [
+            (out_idx, list(sources) if isinstance(sources, (list, tuple)) else [sources])
+            for out_idx, sources in channel_assignments
+        ]
         self._n_out = n_out_channels
 
     @property
@@ -98,15 +102,15 @@ class _MemmapStack:
         x0, x1, _ = x_slice.indices(w_ref)
         tile = np.zeros((y1 - y0, x1 - x0, self._n_out), dtype=self._dtype)
 
-        for out_idx, source in self._assignments:
-            if isinstance(source, list):
-                # pixel-wise max across multiple morphology memmaps, tile-local
-                acc = np.array(source[0][y_slice, x_slice], copy=True)
-                for extra in source[1:]:
+        for out_idx, sources in self._assignments:
+            # sources is always a list (normalized in __init__). Length-1 short-circuits.
+            if len(sources) == 1:
+                tile[..., out_idx] = sources[0][y_slice, x_slice]
+            else:
+                acc = np.array(sources[0][y_slice, x_slice], copy=True)
+                for extra in sources[1:]:
                     np.maximum(acc, extra[y_slice, x_slice], out=acc)
                 tile[..., out_idx] = acc
-            else:
-                tile[..., out_idx] = source[y_slice, x_slice]
         return tile
 
 
@@ -153,9 +157,9 @@ def prepare_cellsam_input(dapi_path, morphology_paths=None):
         a single tile; only the slice region is paged in from disk.
     """
     dapi, morphs = _open_memmaps(dapi_path, morphology_paths)
-    assignments = [(1, dapi)]           # output channel 1 = nucleus
+    assignments = [(1, [dapi])]                 # output channel 1 = nucleus
     if morphs:
-        assignments.append((2, morphs if len(morphs) > 1 else morphs[0]))
+        assignments.append((2, morphs))         # output channel 2 = cell body (pixel-wise max)
     print(f"Lazy CellSAM stack: shape=(H,W)={dapi.shape} + 3 output channels, "
           f"{len(morphs)} morphology channel{'s' if len(morphs) != 1 else ''} (pixel-wise max'd per tile).")
     return _MemmapStack(reference_shape=dapi.shape, dtype=dapi.dtype,
@@ -503,9 +507,9 @@ def prepare_cellpose_input(dapi_path, morphology_paths=None):
         Lazy (H, W, 2) stack. Only the sliced region is paged in from disk per tile.
     """
     dapi, morphs = _open_memmaps(dapi_path, morphology_paths)
-    assignments = [(1, dapi)]           # output channel 1 = nucleus
+    assignments = [(1, [dapi])]                 # output channel 1 = nucleus
     if morphs:
-        assignments.append((0, morphs if len(morphs) > 1 else morphs[0]))
+        assignments.append((0, morphs))         # output channel 0 = cytoplasm (pixel-wise max)
     print(f"Lazy Cellpose stack: shape=(H,W)={dapi.shape} + 2 output channels, "
           f"{len(morphs)} morphology channel{'s' if len(morphs) != 1 else ''} (pixel-wise max'd per tile).")
     return _MemmapStack(reference_shape=dapi.shape, dtype=dapi.dtype,
