@@ -1,121 +1,82 @@
-# SPRINT-seq
+# sprintseq
 
-SPRINTseq (Spatially Resolved and signal-diluted Next-generation Targeted sequencing) is an innovative in situ sequencing strategy that combines hybrid block coding and molecular dilution strategies, allowing an accurate RNA detection in crowded environment. This method can profile a mouse brain coronal slice within 1 day, and generate gene expression architecture in a sub-micron resolution.
+Official analysis pipeline for **SPRINTseq** — *Spatially Resolved and signal-diluted Next-generation Targeted sequencing* — a rapid, signal-crowdedness-robust in situ sequencing method based on hybrid block coding (Chang et al., *PNAS* 2023).
 
-For more information, please read the article.  [Chang et.al (2023) *bioRxiv*](https://doi.org/10.1101/2022.11.16.516714)
+This repository hosts the **post-stitched** side of the pipeline: spot detection, intensity readout, gene calling, density maps, and cell segmentation, all starting from already-stitched whole-slide images. The upstream imaging / stitching code lives in the sibling [`spatial-img-core`](https://github.com/HuangLab-PKU/spatial-img-core) package.
 
-# Code Preview
+## Citation
 
-Code for SPRINT-seq consists of five parts, **barcode_design**, **image_processing**, **gene_calling** **cell_segmentation** and **expression_matrix_analysis**. Data will be processed in this order.
+If you use SPRINTseq in your work, please cite:
 
-# Data Architecture
+> Chang Y., Chakiryan N. H., Dhawan A., Gonzalez B., Du D., Amacher R. K., Hartman T., Liao R., Osipov V., Shain A. H., Wallace D., Ferrari M., & Huang Y. (2023). *Rapid and signal crowdedness-robust in situ sequencing through hybrid block coding.* Proceedings of the National Academy of Sciences, 120(47): e2309227120.
+>
+> - DOI: <https://doi.org/10.1073/pnas.2309227120>
+> - PNAS: <https://www.pnas.org/doi/10.1073/pnas.2309227120>
+> - PubMed: <https://pubmed.ncbi.nlm.nih.gov/37963245/>
+> - PMC: <https://pmc.ncbi.nlm.nih.gov/articles/PMC10666108/>
 
-Raw data base directory and processed data output directory can be whatever place you need. But its subdirectory should be like this:
+## Repository
 
-Raw data root                           
+<https://github.com/HuangLab-PKU/SPRINTseq>
 
-|---RUN_ID1
+## Subpackages
 
-|---RUN_ID2
+| Subpackage | Purpose |
+|---|---|
+| `sprintseq.readout` | Block-based spot detection (Spotiflow / DoG + tophat) and intensity readout from stitched images. |
+| `sprintseq.gene_calling` | Intensity correction (channel balance, decay, phasing) and gene mapping (postcode / threshold / intensity-direct / per-round-max). |
+| `sprintseq.segment` | Cell segmentation (CellSAM / Cellpose with DAPI ± morphology channels) and RNA-to-cell assignment (mask-based or nucleus-centroid KD-tree). |
+| `sprintseq.barcode_design` | Barcode graph design utilities (offline codebook generation). |
 
-|...
+## Install
 
-|---RUN_IDN
+Designed for the `spatial-prep-dp` mamba env alongside `spatial-img-core` and `prism`. Python ≥ 3.10.
 
-
-
-Output root
-
-|---RUN_ID1_processed (automate created)
-
-|    |---focal_stacked (automate created)
-
-|     |---background_corrected (automate created)
-
-|    |---registered (automate created)
-
-|    |---stitched (automate created)
-
-|    |---readout (automate created)
-
-|    |---segmented (automate created)
-
-Your raw data should be in folder RUN_ID.
-
-# Start
-
-This code should be run under `python 3.8`. Later version will bring some environment problems.
-
-To run this code, packages must be installed with command:
-
-```shell
-pip install -r requirements.txt
+```powershell
+mamba run -n spatial-prep-dp pip install -e <path-to-SPRINTseq>\code
 ```
 
-And MATLAB engine should be installed, according to your local MATLAB version, you can follow [official guideline](https://www.mathworks.com/help/matlab/matlab_external/install-the-matlab-engine-for-python.html).  
+### Optional deep-learning dependencies
 
-For example, MATLAB R2021b：`python -m pip install matlabengine==9.11.21`
+Baseline install covers the classical DoG + tophat detection path and the threshold / intensity-direct gene-calling methods — no GPU required. For the DL stack (Spotiflow, PoSTcode, CellSAM, Cellpose), install per-backend:
 
-And **pip setuptools** needs a correct version. 
+| Backend | Install |
+|---|---|
+| Spotiflow (spot detection CNN) | `pip install sprintseq[detection-dl]` |
+| Cellpose (segmentation) | `pip install sprintseq[cellpose]` |
+| **PoSTcode** (probabilistic gene calling, *not on PyPI*) | `pip install -e <path-to-SPRINTseq>\experiments\src\postcode` |
+| **CellSAM** (segmentation, *not on PyPI under this name*) | `pip install -e <path-to-SPRINTseq>\experiments\src\cellsam` |
 
-For MATLAB R2021b: `pip install --upgrade pip setuptools==57.5.0`
+Inside the HuangLab `spatial-prep-dp` env all four backends are usually already editable-installed from `experiments/src/`, so additional install steps are only needed on a fresh machine.
 
-**Remind!** There are lots of paths or directories need to be edited in files mentioned below.
+## CLI
 
-## Barcode Design
+After install a single `sprintseq` command is on `PATH`, dispatching four subcommands:
 
-Code in this part will generate a suitable barcode space for you to choose. 
-
-**Caution!** These codes may cost a lot of memory.
-
-Step 1: Run `generate_graph.py`.  An in-between file will be generated.
-
-Step 2: Run `MIS_variance_trail_qsub.py` using the in-between file as input. Suitable barcodes will be generated in a txt file.
-
-We have provided example in-between file `test_graph_210809_G58.txt` and example final file `min_var_mis_0809_G58.txt`. 
-
-## Image Processing
-
-Step 1: Edit the directory in python file `scan_fstack.py` as the directory you wish. Run the code: 
-
-```shell
-python scan_fstack.py Raw_data_root
+```powershell
+sprintseq --help                                                              # subcommand list
+sprintseq readout       --run-id <RUN_ID> [--n-workers 4]
+sprintseq gene-calling  --run-id <RUN_ID> --ref-file <codebook.csv>
+sprintseq density       --run-id <RUN_ID> [--threshold 0.95] [--fac 200]
+sprintseq segment       --run-id <RUN_ID> [--morphology <file>]... [--model <name>] [--method {auto,cellsam,cellpose,nuclei-kdtree}]
 ```
 
-We have provided a preprocessed example data for Step 2 and pipeline after, which path is `./example_dataset`.  You should create a folder `output_root/whatever_name_processed/focal_stacked/` and put all example data in it.
+Each subcommand's `--help` prints a stage description, current defaults, and an example invocation.
 
-Step 2: Edit the directory in python file `image_process_after_stack.py` the same as the directory before. Run the code: 
+Commands expect a processed-data directory at `\\10.10.10.1\NAS Processed Images\<RUN_ID>_processed\stitched\` with `cyc_{1..N}_{cy3,cy5}.tif` for SBS, and DAPI (± FAM / any cytoplasm or membrane channel) for segmentation.
 
-```shell
-python image_proess_after_stack.py
+For a PowerShell orchestrator that chains readout → gene-calling → density, see `../experiments/run_pipeline.ps1`. Segmentation is run separately because the chosen model and morphology channels are per-run decisions.
+
+## Library use
+
+```python
+from sprintseq.readout import get_spot_coordinates, read_intensity_tophat, block_starts
+from sprintseq.gene_calling import map_genes, correct_intensity, check_sequence
+from sprintseq.segment import (
+    prepare_cellsam_input, run_cellsam_segmentation,
+    assign_spots_to_cells, assign_spots_to_nuclei_kdtree,
+    auto_detect_dapi, auto_detect_morphology,
+)
 ```
 
-Results will be large stitched images, which will be used in next part.
-
-## Gene Calling
-
-Step 1:  Before running code, a padlock sequence file should be provided. It should be a csv file and formatted like:
-
-```csv
-Name,Padlock
-Gene_name1,Padlock_sequence1
-Gene_name2,Padlock_sequence2
-...,...
-Gene_nameN,Padlock_sequenceN
-```
-
-Step 2: Run the jupyter notebook file `generate_ref_files.ipynb`. A reference barcode book will be produced named `Your_Given_Name.csv`.
-
-Step 3: Edit the directory in `Gene_calling.py` and run it. A csv file containing spots coordinate and gene name will be generated, named `output_root/whatever_name_processed/readout/mapped_genes.csv`.
-
-We have provided example csv file `108_plex_10base_barcodes_padlock_sequence.csv` and example barcode book `plex_map_filtered_108plex_10base_barcode.csv`. 
-
-## Cell Segmentation
-
-Edit the directory in `segment.py` and run it. This code will segment cell nucleus according to DAPI channel. A csv file containing the coordinate of nucleus centroid will be generated named `output_root/whatever_name_processed/segmented/centroids_all.csv`.
-
-## Expression Matrix Analysis
-
-Edit the directory and run the jupyter notebook file `integrated_analysis_SPRINTseq.ipynb`, important post processing results will be shown inside the jupyter.
-
-The provided dataset is just an example data, so we provided another true experimental data for post-analysis in folder `example_dataset_whole_brain`. Run `merge.py` to build dataset from splited dataset, and replace `mapped_genes.csv` and `centroids_all.csv` mentioned above with file in this folder to use this dataset for Matrix Analysis.
+Heavy optional deps are lazy-imported: calling `get_spot_coordinates(..., method='spotiflow')`, `map_genes(..., method='postcode')`, or `run_cellsam_segmentation(...)` without the corresponding backend installed raises a clear `ImportError` with the install hint.
