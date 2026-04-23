@@ -39,61 +39,127 @@ def load_and_merge_spots(position_file, mapping_file, probability_threshold=0.8)
     return filtered_df
 
 
-def _merge_morphology(morphology_paths, reference_shape):
-    """Read one or more morphology images and combine into a single channel via pixel-wise max.
+class _MemmapStack:
+    """Virtual (H, W, C_out) multi-channel stack with per-channel backing by 2D memmap arrays.
 
-    Returns `None` if `morphology_paths` is empty. Raises ValueError on shape mismatch.
+    Why this class exists: stitched SPRINTseq images are commonly 30k x 30k (or more)
+    uint16, i.e. ~1.8 GB per channel on disk. Eagerly materialising a (H, W, 3) combined
+    array for CellSAM input would use ~5.4 GB of RAM up-front, before any segmentation
+    runs. Instead this class keeps each channel as a `tifffile.memmap` and constructs
+    the combined (tile_h, tile_w, C_out) array *only for the requested slice* — exactly
+    the access pattern `_run_tiled_inference` wants.
+
+    Supports the minimum ndarray-like interface that `_run_tiled_inference` needs:
+      - `.shape` -> (H, W, C_out)
+      - `.dtype`
+      - `.ndim` = 3
+      - 2D slicing `stack[y_slice, x_slice]` -> real (tile_h, tile_w, C_out) ndarray,
+        built on demand. Only the slice region is paged in from disk.
     """
-    paths = [Path(p) for p in (morphology_paths or [])]
-    if not paths:
-        return None
 
-    acc = None
-    for p in paths:
-        print(f"Reading morphology image: {p}")
-        img = tifffile.imread(str(p))
-        if img.shape != reference_shape:
-            raise ValueError(f"Shape mismatch: morphology {img.shape} vs DAPI {reference_shape} "
-                             f"(source: {p})")
-        acc = img if acc is None else np.maximum(acc, img)
-    return acc
+    def __init__(self, reference_shape, dtype, channel_assignments, n_out_channels):
+        """
+        Parameters
+        ----------
+        reference_shape : tuple (H, W)
+        dtype : numpy dtype
+        channel_assignments : list of (out_idx, source)
+            Each entry places `source` into output channel `out_idx`. `source` is one of:
+              * a 2D ndarray / memmap (used directly),
+              * a list of 2D ndarrays / memmaps (combined via pixel-wise max per tile).
+        n_out_channels : int
+            Width of the output channel axis (3 for CellSAM, 2 for Cellpose).
+        """
+        self._ref_shape = reference_shape
+        self._dtype = dtype
+        self._assignments = channel_assignments
+        self._n_out = n_out_channels
+
+    @property
+    def shape(self):
+        return (*self._ref_shape, self._n_out)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def ndim(self):
+        return 3
+
+    def __getitem__(self, key):
+        if not (isinstance(key, tuple) and len(key) == 2):
+            raise IndexError(
+                f"_MemmapStack supports only 2D slicing stack[y, x]; got {key!r}"
+            )
+        y_slice, x_slice = key
+        h_ref, w_ref = self._ref_shape
+        y0, y1, _ = y_slice.indices(h_ref)
+        x0, x1, _ = x_slice.indices(w_ref)
+        tile = np.zeros((y1 - y0, x1 - x0, self._n_out), dtype=self._dtype)
+
+        for out_idx, source in self._assignments:
+            if isinstance(source, list):
+                # pixel-wise max across multiple morphology memmaps, tile-local
+                acc = np.array(source[0][y_slice, x_slice], copy=True)
+                for extra in source[1:]:
+                    np.maximum(acc, extra[y_slice, x_slice], out=acc)
+                tile[..., out_idx] = acc
+            else:
+                tile[..., out_idx] = source[y_slice, x_slice]
+        return tile
+
+
+def _open_memmaps(dapi_path, morphology_paths):
+    """Open DAPI + optional morphology files as tifffile memmaps; validate shapes.
+
+    Returns (dapi_memmap, morphology_memmap_list).
+    """
+    print(f"Memmapping DAPI image: {dapi_path}")
+    dapi = tifffile.memmap(str(dapi_path))
+    morph_paths = [Path(p) for p in (morphology_paths or [])]
+    morphs = []
+    for p in morph_paths:
+        print(f"Memmapping morphology image: {p}")
+        m = tifffile.memmap(str(p))
+        if m.shape != dapi.shape:
+            raise ValueError(
+                f"Shape mismatch: morphology {m.shape} vs DAPI {dapi.shape} (source: {p})"
+            )
+        morphs.append(m)
+    return dapi, morphs
 
 
 def prepare_cellsam_input(dapi_path, morphology_paths=None):
     """
-    Read DAPI and optional morphology images and combine into CellSAM input shape.
+    Build a lazy (H, W, 3) stack for CellSAM, channels drawn from disk-memmapped files.
 
     CellSAM expects (H, W, 3) with channel 1 = nucleus, channel 2 = cell body. If no
-    morphology channels are supplied, channel 2 stays zero — the model then relies on
-    nucleus morphology only (useful for nucleus-level segmentation workflows).
+    morphology is supplied, channel 2 stays zero and the model operates on nucleus
+    morphology only (useful for nucleus-level workflows).
 
     Parameters
     ----------
     dapi_path : str | Path
         DAPI (nucleus) image.
     morphology_paths : list[str | Path] | None
-        Zero or more membrane/cytoplasm/cell-body channel images. Multiple images are
-        combined via pixel-wise max before stacking with DAPI.
+        Zero or more cell-body channel images (FAM, CellMask, WGA, etc.). Multiple
+        channels are combined via pixel-wise max, computed per-tile at read time.
 
     Returns
     -------
-    np.ndarray
-        (H, W, 3) image ready for cellSAM.
+    _MemmapStack
+        Lazy (H, W, 3) stack. Slice it with `stack[y_slice, x_slice]` to materialise
+        a single tile; only the slice region is paged in from disk.
     """
-    print(f"Reading DAPI image: {dapi_path}")
-    dapi = tifffile.imread(str(dapi_path))
-    h, w = dapi.shape
-    morph = _merge_morphology(morphology_paths, dapi.shape)
-
-    combined = np.zeros((h, w, 3), dtype=dapi.dtype)
-    combined[..., 1] = dapi
-    if morph is not None:
-        combined[..., 2] = morph
-
-    n_morph = len(morphology_paths) if morphology_paths else 0
-    print(f"Combined image shape for CellSAM: {combined.shape} "
-          f"(DAPI + {n_morph} morphology channel{'s' if n_morph != 1 else ''}).")
-    return combined
+    dapi, morphs = _open_memmaps(dapi_path, morphology_paths)
+    assignments = [(1, dapi)]           # output channel 1 = nucleus
+    if morphs:
+        assignments.append((2, morphs if len(morphs) > 1 else morphs[0]))
+    print(f"Lazy CellSAM stack: shape=(H,W)={dapi.shape} + 3 output channels, "
+          f"{len(morphs)} morphology channel{'s' if len(morphs) != 1 else ''} (pixel-wise max'd per tile).")
+    return _MemmapStack(reference_shape=dapi.shape, dtype=dapi.dtype,
+                        channel_assignments=assignments, n_out_channels=3)
 
 
 def _apply_cellsam_patches():
@@ -417,38 +483,33 @@ def run_cellsam_segmentation(img_combined, block_size=2048, overlap=256, **kwarg
 
 def prepare_cellpose_input(dapi_path, morphology_paths=None):
     """
-    Read DAPI and optional morphology images and combine into Cellpose input shape.
+    Build a lazy (H, W, 2) stack for Cellpose, channels drawn from disk-memmapped files.
 
-    Cellpose expects (H, W, 2) with channel 0 = cytoplasm and channel 1 = nucleus.
-    If no morphology channels are supplied, channel 0 stays zero and Cellpose falls back
-    to nucleus-only segmentation.
+    Cellpose expects (H, W, 2) with channel 0 = cytoplasm, channel 1 = nucleus.
+    If no morphology is supplied, channel 0 stays zero and Cellpose falls back to
+    nucleus-only segmentation.
 
     Parameters
     ----------
     dapi_path : str | Path
         DAPI (nucleus) image.
     morphology_paths : list[str | Path] | None
-        Zero or more cytoplasm/membrane channels; combined via pixel-wise max if multiple.
+        Zero or more cytoplasm / membrane channels; combined via pixel-wise max
+        per tile at read time.
 
     Returns
     -------
-    np.ndarray
-        (H, W, 2) image ready for Cellpose.
+    _MemmapStack
+        Lazy (H, W, 2) stack. Only the sliced region is paged in from disk per tile.
     """
-    print(f"Reading DAPI image: {dapi_path}")
-    dapi = tifffile.imread(str(dapi_path))
-    h, w = dapi.shape
-    morph = _merge_morphology(morphology_paths, dapi.shape)
-
-    img_stacked = np.zeros((h, w, 2), dtype=dapi.dtype)
-    img_stacked[..., 1] = dapi
-    if morph is not None:
-        img_stacked[..., 0] = morph
-
-    n_morph = len(morphology_paths) if morphology_paths else 0
-    print(f"Stacked image shape for Cellpose: {img_stacked.shape} "
-          f"(DAPI + {n_morph} morphology channel{'s' if n_morph != 1 else ''}).")
-    return img_stacked
+    dapi, morphs = _open_memmaps(dapi_path, morphology_paths)
+    assignments = [(1, dapi)]           # output channel 1 = nucleus
+    if morphs:
+        assignments.append((0, morphs if len(morphs) > 1 else morphs[0]))
+    print(f"Lazy Cellpose stack: shape=(H,W)={dapi.shape} + 2 output channels, "
+          f"{len(morphs)} morphology channel{'s' if len(morphs) != 1 else ''} (pixel-wise max'd per tile).")
+    return _MemmapStack(reference_shape=dapi.shape, dtype=dapi.dtype,
+                        channel_assignments=assignments, n_out_channels=2)
 
 
 def run_cellpose_segmentation(img_stacked, pretrained_model='cpsam', use_gpu=True):

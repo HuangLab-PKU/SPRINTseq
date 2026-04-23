@@ -267,26 +267,32 @@ def test_single_tile_mapping(run_id, tile_name, ref_file, method='postcode', **k
         import traceback
         traceback.print_exc()
 
-def run_pipeline(run_id=None, ref_file=None):
-    """Main function to transform coordinates and filter unreliable points.
-    
+def run_pipeline(run_id=None, ref_file=None, seq_cycle=None, channels=None):
+    """Main function to run intensity correction + gene mapping for a RUN_ID.
+
     Parameters
     ----------
-    run_id : str, optional
-        Run ID (e.g., '20251128_ZCH_BZ09_Re2_mut_new')
-        If None, uses RUN_ID from global configuration
-    ref_file : str or Path, optional
-        Path to reference codebook file (e.g., CSV file with gene barcodes)
-        If None, uses DEFAULT_REF_FILE
+    run_id : str
+        Run ID (e.g., '20251128_ZCH_BZ09_Re2_mut_new').
+    ref_file : str or Path
+        Path to reference codebook file (CSV with Barcode, Gene columns).
+    seq_cycle : int, optional
+        Number of sequencing cycles to decode. Defaults to SEQ_CYCLE (=10).
+    channels : list[str], optional
+        SBS spot channels. Defaults to CHANNELS (=['cy3','cy5']).
     """
     # Validate required parameters
     if run_id is None:
         raise ValueError("run_id is required and cannot be None")
-    
+
     if ref_file is None:
         raise ValueError("ref_file is required and cannot be None")
-    
+
     ref_file = Path(ref_file)
+    if seq_cycle is None:
+        seq_cycle = SEQ_CYCLE
+    if channels is None:
+        channels = CHANNELS
     
     # Build structured paths based on RUN_ID
     dest_dir = BASE_DIR / f'{run_id}_processed'
@@ -332,8 +338,8 @@ def run_pipeline(run_id=None, ref_file=None):
             'name': 'postcode',
             'method': 'postcode',
             'kwargs': {
-                'cyc_num': SEQ_CYCLE,
-                'channels': CHANNELS,
+                'cyc_num': seq_cycle,
+                'channels': channels,
                 'batch_size': 100000,
                 'num_iter': 60,
                 'verbose': True,
@@ -347,8 +353,8 @@ def run_pipeline(run_id=None, ref_file=None):
         #     'kwargs': {
         #         'thresholds': {'cy3': 50, 'cy5': 50},
         #         'adaptive_threshold': False,  # Use fixed thresholds
-        #         'cyc_num': SEQ_CYCLE,
-        #         'channels': CHANNELS,
+        #         'cyc_num': seq_cycle,
+        #         'channels': channels,
         #         'verbose': True
         #     }
         # }
@@ -373,8 +379,8 @@ def run_pipeline(run_id=None, ref_file=None):
         # This includes: channel balance correction, decay correction, and phasing correction
         intensity_df_corrected, correction_info = correct_intensity(
             global_intensity_df,
-            cyc_num=SEQ_CYCLE,
-            channels=CHANNELS,
+            cyc_num=seq_cycle,
+            channels=channels,
             estimate_phasing=True,  # Automatically estimate phasing rates using all data
             phasing_estimation_method='grid_search',
             ref_file=str(ref_file),
@@ -615,6 +621,10 @@ def run_pipeline(run_id=None, ref_file=None):
     print("=" * 80)
 
 
+def _parse_channels(value):
+    return [c.strip() for c in str(value).split(',') if c.strip()] if value else None
+
+
 def main():
     """`python -m sprintseq.cli.gene_calling` fallback entry point. The canonical CLI is `sprintseq gene-calling` (see sprintseq.cli.main)."""
     parser = argparse.ArgumentParser(description='Gene calling pipeline for SPRINTseq')
@@ -622,8 +632,13 @@ def main():
                         help='Run ID to process (e.g., "20251211_ZCH_BZ29_TNBC_marker_test1")')
     parser.add_argument('--ref-file', type=str, required=True,
                         help='Path to reference codebook file (e.g., CSV file with gene barcodes)')
+    parser.add_argument('--seq-cycles', type=int, default=None,
+                        help=f'Number of sequencing cycles to decode. Default: {SEQ_CYCLE}')
+    parser.add_argument('--channels', type=_parse_channels, default=None,
+                        help=f'Comma-separated SBS channels. Default: {",".join(CHANNELS)}')
     args = parser.parse_args()
-    run_pipeline(run_id=args.run_id, ref_file=args.ref_file)
+    run_pipeline(run_id=args.run_id, ref_file=args.ref_file,
+                 seq_cycle=args.seq_cycles, channels=args.channels)
 
 
 if __name__ == "__main__":
