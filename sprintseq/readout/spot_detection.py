@@ -6,6 +6,7 @@ import logging
 import gc
 from pathlib import Path
 from skimage.io import imread
+from skimage.feature import blob_log
 from concurrent.futures import ProcessPoolExecutor
 
 logger = logging.getLogger('readout_spot_detection')
@@ -210,6 +211,56 @@ def feature_gaussian_tophat(image, sigma=1.0, tophat_radius=3):
 
 # Backward compatibility alias
 preprocess_image_in_memory = feature_gaussian_dog
+
+
+def blob_log_detection(image, min_sigma=1.0, max_sigma=2.0, num_sigma=2,
+                       threshold=0.005, overlap=0.5):
+    """End-to-end LoG (Laplacian of Gaussian) spot detection via skimage.feature.blob_log.
+
+    skimage.feature.blob_log performs scale-space LoG filtering at num_sigma
+    intermediate sigmas in [min_sigma, max_sigma], finds local maxima of the
+    scale-normalized response, and merges overlapping blobs by area-overlap NMS.
+    The result is a set of (y, x, sigma) blob descriptors; this wrapper returns
+    only (y, x) coordinates so it slots into the same return contract as the
+    other methods in get_spot_coordinates.
+
+    Approximates the Fiji TrackMate LogDetector (LogDetector.java). For
+    TrackMate's `radius` parameter on a 2D image, sigma ~= radius / sqrt(2)
+    (e.g. radius=2.0 -> sigma~=1.41). TrackMate's threshold is in raw image
+    units; skimage.blob_log applies threshold on the scale-normalized LoG
+    response of the float-converted image, so plan to retune empirically.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Input image. blob_log calls img_as_float internally
+        (uint16 -> /65535, float assumed in [0, 1]).
+    min_sigma, max_sigma : float
+        Bounds of the Gaussian sigma swept by blob_log.
+    num_sigma : int
+        Number of intermediate sigmas, >= 1. Use 1 for a single-scale LoG.
+    threshold : float
+        Absolute lower bound on the scale-normalized LoG response.
+    overlap : float
+        NMS overlap threshold; blobs whose pairwise area-overlap exceeds
+        this are merged (smaller-sigma blob discarded).
+
+    Returns
+    -------
+    np.ndarray
+        (N, 2) array of (Y, X) coordinates as float32. Empty (0, 2) if none.
+    """
+    blobs = blob_log(
+        image,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+        num_sigma=num_sigma,
+        threshold=threshold,
+        overlap=overlap,
+    )
+    if blobs is None or len(blobs) == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    return blobs[:, :2].astype(np.float32, copy=False)
 
 
 def find_maxima(image, tolerance, threshold=None, strict=False, exclude_on_edges=False, min_distance=2):
@@ -545,36 +596,55 @@ def _extract_features(image, method, **kwargs):
 
 def get_spot_coordinates(image, method='spotiflow', min_distance=2, **kwargs):
     """Detect spot coordinates from an image using specified detection method.
-    
+
     This is the unified interface for spot detection. It supports both traditional
-    two-stage methods (feature extraction → peak detection) and end-to-end deep
-    learning methods.
-    
+    two-stage methods (feature extraction → peak detection) and end-to-end methods
+    that produce coordinates directly.
+
     Traditional methods ('gaussian_tophat', 'gaussian_dog', 'tophat', 'dog'):
         - Extract features from the image
         - Apply find_maxima to detect peak coordinates
-    
-    Deep learning methods ('spotiflow'):
-        - Perform end-to-end detection directly from image to coordinates
-    
+
+    End-to-end methods ('spotiflow', 'blob_log'):
+        - Perform detection directly from image to coordinates
+        - 'spotiflow': deep-learning detector (lazy-imported)
+        - 'blob_log': scale-space LoG via skimage.feature.blob_log
+          (approximates Fiji TrackMate LogDetector)
+
     Parameters
     ----------
     image : np.ndarray
         Input image (uint16)
     method : str
-        Spot detection method: 'gaussian_tophat', 'gaussian_dog', 'tophat', 'dog', or 'spotiflow'
+        Spot detection method: 'gaussian_tophat', 'gaussian_dog', 'tophat',
+        'dog', 'spotiflow', or 'blob_log'.
     min_distance : int
-        Minimum distance between peaks
+        Minimum distance between peaks (only used by traditional methods'
+        find_maxima post-processing; blob_log uses its own overlap NMS).
     **kwargs
         Additional parameters for the detection method.
-        For traditional methods: 'snr' sets threshold as snr * image_median
-        For 'spotiflow': 'model_path', 'pretrained_name', 'device', 'prob_thresh' are supported
-        
+        For traditional methods: 'snr' sets threshold as snr * image_median.
+        For 'spotiflow': 'model_path', 'pretrained_name', 'device', 'prob_thresh'.
+        For 'blob_log': 'min_sigma', 'max_sigma', 'num_sigma', 'threshold', 'overlap'.
+
     Returns
     -------
     np.ndarray
         (N, 2) array of (Y, X) coordinates. Coordinates can be float or int.
     """
+    # End-to-end LoG detection via skimage.feature.blob_log
+    if method == 'blob_log':
+        min_sigma = kwargs.pop('min_sigma', 1.0)
+        max_sigma = kwargs.pop('max_sigma', 2.0)
+        num_sigma = kwargs.pop('num_sigma', 2)
+        threshold = kwargs.pop('threshold', 0.005)
+        overlap = kwargs.pop('overlap', 0.5)
+        return blob_log_detection(
+            image,
+            min_sigma=min_sigma, max_sigma=max_sigma, num_sigma=num_sigma,
+            threshold=threshold, overlap=overlap,
+        )
+
     # Handle spotiflow method separately (end-to-end detection)
     if method == 'spotiflow':
         import torch
@@ -714,7 +784,7 @@ def get_coordinates_for_tile(registered_dir, tile_name, channels, cycle_num, snr
         - For 'gaussian_dog': sigma1, sigma2, normalize_percentile
         - For 'tophat': tophat_radius
         - For 'gaussian_tophat': sigma, tophat_radius
-        - For 'spotiflow': model_path, pretrained_name, device, confidence_threshold
+        - For 'spotiflow': model_path, pretrained_name, device, prob_thresh
         
     Returns
     -------
@@ -734,9 +804,6 @@ def get_coordinates_for_tile(registered_dir, tile_name, channels, cycle_num, snr
         default_kwargs = {'tophat_radius': 3}
     elif method == 'gaussian_tophat':
         default_kwargs = {'sigma': 1.0, 'tophat_radius': 3}
-    elif method == 'spotiflow':
-        # Spotiflow defaults: use confidence threshold instead of SNR
-        default_kwargs = {'confidence_threshold': 0.5}
     else:
         raise ValueError(f"Unknown method: {method}")
     

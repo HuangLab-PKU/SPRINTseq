@@ -84,6 +84,15 @@ def _build_readout(sub):
         help=f"Comma-separated SBS spot channels, used for BOTH detection and intensity. "
              f"(default: {','.join(readout_mod.CHANNELS)})",
     )
+    p.add_argument(
+        "--detection-method", type=str, default=None,
+        choices=list(readout_mod.DETECTION_METHODS),
+        help=f"Spot detection method dispatched in get_spot_coordinates. "
+             f"'spotiflow' (DL), 'blob_log' (skimage scale-space LoG, "
+             f"approximates Fiji TrackMate LogDetector), or one of the classical "
+             f"feature-extraction methods backed by find_maxima. "
+             f"(default: {readout_mod.DETECTION_METHOD!r})",
+    )
     p.set_defaults(_func=_run_readout)
 
 
@@ -100,6 +109,7 @@ def _run_readout(args):
         detection_cycles=args.detection_cycles,
         seq_cycle=args.seq_cycles,
         channels=args.channels,
+        detection_method=args.detection_method,
     )
 
 
