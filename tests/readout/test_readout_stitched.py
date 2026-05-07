@@ -92,6 +92,80 @@ class TestDetectSpotsInBlock:
         assert len(coords) == 0
 
 
+class TestBlobLogDetection:
+    """LoG detection via skimage.feature.blob_log (method='blob_log')."""
+
+    def test_returns_n_by_2_float32(self):
+        """get_spot_coordinates returns (N, 2) float32 array for method='blob_log'."""
+        from sprintseq.readout.spot_detection import get_spot_coordinates
+        block = _create_synthetic_image(64, 64, spots=[(20, 30, 60000)])
+        coords = get_spot_coordinates(
+            block, method='blob_log',
+            min_sigma=1.0, max_sigma=2.0, num_sigma=2,
+            threshold=0.005, overlap=0.5,
+        )
+        assert isinstance(coords, np.ndarray)
+        assert coords.ndim == 2
+        assert coords.shape[1] == 2
+        assert coords.dtype == np.float32
+
+    def test_detects_known_spots(self):
+        """LoG finds two known synthetic spots within +/-2 px of ground truth."""
+        from sprintseq.readout.spot_detection import get_spot_coordinates
+        spots_truth = [(20, 30, 60000), (45, 50, 55000)]
+        block = _create_synthetic_image(80, 80, spots=spots_truth)
+        coords = get_spot_coordinates(
+            block, method='blob_log',
+            min_sigma=1.0, max_sigma=2.0, num_sigma=2,
+            threshold=0.005, overlap=0.5,
+        )
+        assert len(coords) >= 2, f"expected >=2 detections, got {len(coords)}"
+        for y, x, _ in spots_truth:
+            distances = np.sqrt(((coords - np.array([y, x])) ** 2).sum(axis=1))
+            assert distances.min() <= 2.0, f"spot ({y}, {x}) not found within 2 px"
+
+    def test_empty_image_returns_empty(self):
+        """Uniform image returns empty (0, 2) float32 result."""
+        from sprintseq.readout.spot_detection import get_spot_coordinates
+        block = np.full((64, 64), 200, dtype=np.uint16)
+        coords = get_spot_coordinates(
+            block, method='blob_log',
+            min_sigma=1.0, max_sigma=2.0, num_sigma=2,
+            threshold=0.01, overlap=0.5,
+        )
+        assert coords.shape == (0, 2)
+        assert coords.dtype == np.float32
+
+    def test_kwargs_forwarded_to_skimage(self):
+        """min_sigma / max_sigma / num_sigma / threshold / overlap reach skimage.feature.blob_log."""
+        from unittest.mock import patch
+        from sprintseq.readout.spot_detection import get_spot_coordinates
+
+        block = np.zeros((32, 32), dtype=np.uint16)
+        expected = dict(
+            min_sigma=1.5, max_sigma=2.5, num_sigma=3,
+            threshold=0.012, overlap=0.4,
+        )
+        with patch(
+            'sprintseq.readout.spot_detection.blob_log',
+            return_value=np.empty((0, 3), dtype=np.float64),
+        ) as mock_blob:
+            get_spot_coordinates(block, method='blob_log', **expected)
+            assert mock_blob.called, 'skimage.feature.blob_log was not invoked'
+            kwargs = mock_blob.call_args.kwargs
+            for k, v in expected.items():
+                assert kwargs.get(k) == v, f'kwarg {k}: expected {v}, got {kwargs.get(k)}'
+
+    def test_default_detection_kwargs_for_blob_log(self):
+        """CLI's default kwargs builder produces the documented blob_log dict."""
+        from sprintseq.cli.readout import _default_detection_kwargs
+        kw = _default_detection_kwargs('blob_log', channel='cy3', snrs={'cy3': 3.0})
+        assert kw == {
+            'min_sigma': 1.0, 'max_sigma': 2.0, 'num_sigma': 2,
+            'threshold': 0.005, 'overlap': 0.5,
+        }
+
+
 class TestReadIntensityInBlock:
     def test_reads_tophat_intensity_at_coords(self):
         """Intensity values are non-negative and match expected shape."""

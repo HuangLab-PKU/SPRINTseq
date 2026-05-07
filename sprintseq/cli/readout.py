@@ -53,6 +53,16 @@ DETECTION_CYCLES = [1, 2, 3, 4]
 SNRS = {'cy3': 3.0, 'cy5': 3.0}
 DETECTION_METHOD = 'spotiflow'
 
+# Spotiflow defaults. Set during run 6 iter6 (2026-04-25) on the BZ29 TNBC
+# marker panel: hybiss recovers ~+90 % weak cy3 spots vs `general`, and
+# prob_thresh=0.1 is intentionally permissive — postcode downstream filters
+# noise via Background/Infeasible classes. Re-tune per panel using
+# experiments/notebooks/readout_spotiflow_test.ipynb before each new run and
+# overwrite these two values; they are the single source of truth for the
+# pipeline's Spotiflow config.
+SPOTIFLOW_PRETRAINED_NAME = 'hybiss'
+SPOTIFLOW_PROB_THRESH = 0.1
+
 # Intensity readout — sequencing cycles are consecutive 1..SEQ_CYCLE
 SEQ_CYCLE = 10
 TOPHAT_RADIUS = 3
@@ -68,6 +78,55 @@ DEDUPLICATE_THRESHOLD = 2  # Pixels (Chebyshev distance)
 
 # Parallelism
 N_WORKERS = 4
+
+# Methods accepted by `--detection-method` and dispatched in
+# sprintseq.readout.spot_detection.get_spot_coordinates.
+DETECTION_METHODS = (
+    'spotiflow',
+    'blob_log',
+    'dog', 'gaussian_dog',
+    'tophat', 'gaussian_tophat',
+)
+
+
+def _default_detection_kwargs(detection_method, channel, snrs=None):
+    """Default per-method kwargs forwarded to get_spot_coordinates.
+
+    Centralises method-specific defaults so the same dict drives both the
+    in-process pipeline and any external test or per-run override script.
+    Only the default values live here; the user is free to fork and tune.
+
+    Parameters
+    ----------
+    detection_method : str
+        One of DETECTION_METHODS.
+    channel : str
+        SBS channel name (e.g. 'cy3'); used to look up per-channel SNR for
+        the traditional / classical detection methods.
+    snrs : dict, optional
+        Mapping of channel -> SNR threshold. Falls back to module-level SNRS.
+
+    Returns
+    -------
+    dict
+        Keyword args to pass to get_spot_coordinates(image, method=..., **kwargs).
+    """
+    if detection_method == 'spotiflow':
+        return {
+            'prob_thresh': SPOTIFLOW_PROB_THRESH,
+            'device': None,
+            'pretrained_name': SPOTIFLOW_PRETRAINED_NAME,
+        }
+    if detection_method == 'blob_log':
+        # Approximate match to Fiji TrackMate LogDetector with radius=2.0.
+        # sigma ~ radius/sqrt(2) ~ 1.41; threshold lives on skimage's
+        # img_as_float + scale-normalized LoG response, retune empirically.
+        return {
+            'min_sigma': 1.0, 'max_sigma': 2.0, 'num_sigma': 2,
+            'threshold': 0.005, 'overlap': 0.5,
+        }
+    snrs = snrs if snrs is not None else SNRS
+    return {'snr': snrs.get(channel, 3.0), 'tophat_radius': TOPHAT_RADIUS}
 
 
 # ========== Worker Functions (module-level for pickling) ==========
@@ -162,13 +221,6 @@ def detect_all_spots(
             h, w = (sh[0], sh[1]) if len(sh) == 2 else (sh[1], sh[2])
             n_total_blocks += len(block_starts(h, w, block_size, block_overlap))
 
-    # Build detection kwargs per channel
-    def _get_detection_kwargs(channel):
-        if detection_method == 'spotiflow':
-            return {'prob_thresh': None, 'device': None}  # let get_spot_coordinates auto-detect
-        else:
-            return {'snr': snrs.get(channel, 3.0), 'tophat_radius': TOPHAT_RADIUS}
-
     # Lazy iterator: open memmap per image, yield blocks as numpy arrays
     def _detection_task_iter():
         for cyc in detection_cycles:
@@ -176,7 +228,7 @@ def detect_all_spots(
                 img_path = _get_stitched_image_path(stc_dir, cyc, channel)
                 if not img_path.exists():
                     continue
-                detection_kwargs = _get_detection_kwargs(channel)
+                detection_kwargs = _default_detection_kwargs(detection_method, channel, snrs)
                 img = tifffile.memmap(str(img_path))
                 if img.ndim == 3:
                     img = img[0]
@@ -364,7 +416,7 @@ def read_all_intensities(
 
 
 def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
-                 channels=None):
+                 channels=None, detection_method=None):
     """Main entry point for stitched-image readout pipeline.
 
     Parameters
@@ -383,6 +435,9 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     channels : list[str], optional
         SBS spot channels. Defaults to CHANNELS (['cy3','cy5']). Used for both
         detection and intensity readout.
+    detection_method : str, optional
+        Detection method dispatched in get_spot_coordinates. One of
+        DETECTION_METHODS. Defaults to module-level DETECTION_METHOD.
     """
     # Copy list defaults so callers can't mutate the module-level state via
     # the returned reference.
@@ -390,6 +445,12 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     detection_cycles = list(DETECTION_CYCLES) if detection_cycles is None else list(detection_cycles)
     seq_cycle = SEQ_CYCLE if seq_cycle is None else seq_cycle
     channels = list(CHANNELS) if channels is None else list(channels)
+    detection_method = DETECTION_METHOD if detection_method is None else detection_method
+    if detection_method not in DETECTION_METHODS:
+        raise ValueError(
+            f"Unknown detection_method={detection_method!r}; "
+            f"expected one of {DETECTION_METHODS}"
+        )
 
     dest_dir = Path(BASE_DEST_DIRECTORY) / f'{run_id}_processed'
     stc_dir = dest_dir / 'stitched'
@@ -406,7 +467,7 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     logger.info(f"Run ID: {run_id}")
     logger.info(f"Stitched dir: {stc_dir}")
     logger.info(f"Output dir: {read_dir}")
-    logger.info(f"Detection: {DETECTION_METHOD}, cycles {detection_cycles}, channels {channels}")
+    logger.info(f"Detection: {detection_method}, cycles {detection_cycles}, channels {channels}")
     logger.info(f"Intensity: tophat (radius={TOPHAT_RADIUS}, search={SEARCH_RADIUS}), "
                 f"cycles 1-{seq_cycle}, channels {channels}")
     logger.info(f"Block size: {BLOCK_SIZE}, overlap: {BLOCK_OVERLAP}")
@@ -423,7 +484,7 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
         detection_cycles=detection_cycles,
         block_size=BLOCK_SIZE,
         block_overlap=BLOCK_OVERLAP,
-        detection_method=DETECTION_METHOD,
+        detection_method=detection_method,
         snrs=SNRS,
         n_workers=n_workers,
     )
@@ -534,6 +595,9 @@ def main():
                              f'Default: {SEQ_CYCLE}')
     parser.add_argument('--channels', type=parse_channels, default=None,
                         help=f'Comma-separated SBS channels. Default: {",".join(CHANNELS)}')
+    parser.add_argument('--detection-method', type=str, default=None,
+                        choices=list(DETECTION_METHODS),
+                        help=f'Spot detection method. Default: {DETECTION_METHOD}')
     args = parser.parse_args()
 
     # Log to file
@@ -546,7 +610,8 @@ def main():
     run_pipeline(args.run_id, n_workers=args.n_workers,
                  detection_cycles=args.detection_cycles,
                  seq_cycle=args.seq_cycles,
-                 channels=args.channels)
+                 channels=args.channels,
+                 detection_method=args.detection_method)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from .spot_detection import (
     feature_gaussian_dog,
     feature_tophat,
     feature_dog,
+    blob_log_detection,
     get_spot_coordinates,
     get_coordinates_for_tile,
 )
@@ -30,6 +31,7 @@ __all__ = [
     'feature_tophat',
     'feature_dog',
     # Spot detection
+    'blob_log_detection',
     'get_spot_coordinates',
     'get_coordinates_for_tile',
     # Intensity reading
