@@ -1,6 +1,25 @@
 """CLI entry points for sprintseq subcommands + shared argparse type parsers."""
 
 import argparse
+import math
+
+
+def quality_to_threshold(q):
+    """Convert Phred quality score to probability threshold.
+
+    Q20 → 0.99, Q30 → 0.999, Q13 ≈ 0.95.
+    """
+    return 1.0 - 10.0 ** (-q / 10.0)
+
+
+def resolve_threshold_and_label(threshold, quality):
+    """Return (probability, directory_label) from --threshold / -Q flags.
+
+    Exactly one of *threshold* or *quality* should be set.
+    """
+    if quality is not None:
+        return quality_to_threshold(quality), f"Q{quality}"
+    return threshold, str(threshold)
 
 
 def parse_cycles(value):

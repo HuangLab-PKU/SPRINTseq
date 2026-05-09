@@ -60,7 +60,26 @@ def parse_gene_name(gene):
     return m.group(1) if m else gene
 
 
-def generate_density_maps(read_dir, stc_dir, density_dir, threshold=DEFAULT_THRESHOLD, fac=DEFAULT_FAC):
+def fill_missing_genes(density_dir, ref_file, target_shape):
+    """Create zero-filled density TIFs for codebook genes absent from *density_dir*.
+
+    Returns list of gene names that were filled.
+    """
+    codebook = pd.read_csv(ref_file)
+    expected = sorted({parse_gene_name(g) for g in codebook['Gene']})
+    existing = {os.path.splitext(f)[0] for f in os.listdir(density_dir) if f.endswith('.tif')}
+    blank = np.zeros(target_shape, dtype=np.uint16)
+    filled = []
+    for gene in expected:
+        if gene not in existing:
+            imwrite(os.path.join(density_dir, f'{gene}.tif'), blank)
+            filled.append(gene)
+    if filled:
+        logger.info("Filled %d missing genes with black: %s", len(filled), ', '.join(filled))
+    return filled
+
+
+def generate_density_maps(read_dir, stc_dir, density_dir, threshold=DEFAULT_THRESHOLD, fac=DEFAULT_FAC, ref_file=None):
     """Generate per-gene density TIFF maps using vectorized bincount.
 
     All genes are processed in a single pass over the coordinate data:
@@ -81,6 +100,9 @@ def generate_density_maps(read_dir, stc_dir, density_dir, threshold=DEFAULT_THRE
         Minimum probability threshold for including a spot
     fac : int
         Downsample factor (block size for binning)
+    ref_file : str, optional
+        Codebook CSV. When provided, genes present in the codebook but absent
+        from the data are written as all-zero (black) density TIFs.
     """
     t0 = time.time()
 
@@ -132,11 +154,16 @@ def generate_density_maps(read_dir, stc_dir, density_dir, threshold=DEFAULT_THRE
     for i, gene in enumerate(tqdm(gene_names, desc="Writing density maps")):
         imwrite(os.path.join(density_dir, f'{gene}.tif'), density_cube[i])
 
+    if ref_file:
+        fill_missing_genes(density_dir, ref_file, (target_rows, target_cols))
+
     elapsed = time.time() - t0
     logger.info(f"Done! {n_genes} density maps in {elapsed:.1f}s")
 
+    return density_cube, gene_names, df
 
-def run_pipeline(run_id, threshold=DEFAULT_THRESHOLD, fac=DEFAULT_FAC):
+
+def run_pipeline(run_id, threshold=DEFAULT_THRESHOLD, fac=DEFAULT_FAC, ref_file=None, density_label=None):
     """Main entry point.
 
     Parameters
@@ -147,11 +174,18 @@ def run_pipeline(run_id, threshold=DEFAULT_THRESHOLD, fac=DEFAULT_FAC):
         Probability threshold
     fac : int
         Downsample factor
+    ref_file : str, optional
+        Codebook CSV; missing genes are filled with black density TIFs.
+    density_label : str, optional
+        Override for the density subdirectory suffix (e.g. ``'Q20'``).
+        Defaults to ``str(threshold)``.
     """
+    if density_label is None:
+        density_label = str(threshold)
     dest_dir = os.path.join(BASE_DEST_DIRECTORY, f'{run_id}_processed')
     stc_dir = os.path.join(dest_dir, 'stitched')
     read_dir = os.path.join(dest_dir, 'readout')
-    density_dir = os.path.join(read_dir, f'density_{threshold}')
+    density_dir = os.path.join(read_dir, f'density_{density_label}')
 
     if not os.path.isdir(read_dir):
         raise FileNotFoundError(f"Readout directory not found: {read_dir}")
@@ -161,8 +195,28 @@ def run_pipeline(run_id, threshold=DEFAULT_THRESHOLD, fac=DEFAULT_FAC):
     logger.info("=" * 60)
     logger.info(f"Run ID: {run_id}")
     logger.info(f"Threshold: {threshold}, Downsample factor: {fac}")
+    if ref_file:
+        logger.info(f"Codebook: {ref_file} (missing genes will be filled with black)")
 
-    generate_density_maps(read_dir, stc_dir, density_dir, threshold=threshold, fac=fac)
+    result = generate_density_maps(read_dir, stc_dir, density_dir, threshold=threshold, fac=fac, ref_file=ref_file)
+
+    if result is not None:
+        density_cube, gene_names, df_filtered = result
+        try:
+            from sprintseq.qc import generate_density_qc
+            generate_density_qc(
+                df_filtered=df_filtered,
+                density_cube=density_cube,
+                gene_names=gene_names,
+                output_dir=read_dir,
+                run_id=run_id,
+                threshold=threshold,
+                fac=fac,
+                density_label=density_label,
+            )
+            logger.info(f"  density_{density_label}_qc.* saved to {read_dir}")
+        except Exception as e:
+            logger.warning(f"QC generation failed (non-fatal): {e}")
 
 
 def main():
@@ -172,15 +226,23 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
+    from sprintseq.cli import resolve_threshold_and_label
+
     parser = argparse.ArgumentParser(description='Generate per-gene density maps from postcode mapping')
     parser.add_argument('--run-id', type=str, required=True, help='Run ID to process')
-    parser.add_argument('--threshold', type=float, default=DEFAULT_THRESHOLD,
+    parser.add_argument('--threshold', type=float, default=None,
                         help=f'Probability threshold (default: {DEFAULT_THRESHOLD})')
+    parser.add_argument('-Q', '--quality', type=int, default=None,
+                        help='Phred quality score (Q20=0.99, Q30=0.999). Overrides --threshold.')
     parser.add_argument('--fac', type=int, default=DEFAULT_FAC,
                         help=f'Downsample factor (default: {DEFAULT_FAC})')
+    parser.add_argument('--ref-file', type=str, default=None,
+                        help='Codebook CSV; missing genes filled with black density TIFs')
     args = parser.parse_args()
 
-    run_pipeline(args.run_id, threshold=args.threshold, fac=args.fac)
+    threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD
+    prob, label = resolve_threshold_and_label(threshold, args.quality)
+    run_pipeline(args.run_id, threshold=prob, fac=args.fac, ref_file=args.ref_file, density_label=label)
 
 
 if __name__ == "__main__":

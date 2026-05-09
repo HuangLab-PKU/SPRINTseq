@@ -20,10 +20,11 @@ from pathlib import Path
 # These imports are lazy where possible to keep --help fast and avoid pulling
 # in heavy deps before the user chooses a subcommand.
 from sprintseq.cli import density as density_mod
+from sprintseq.cli import density_stack as ds_mod
 from sprintseq.cli import gene_calling as gc_mod
 from sprintseq.cli import readout as readout_mod
 from sprintseq.cli import segment as segment_mod
-from sprintseq.cli import parse_cycles, parse_channels
+from sprintseq.cli import parse_cycles, parse_channels, resolve_threshold_and_label
 
 
 def _build_readout(sub):
@@ -180,20 +181,109 @@ def _build_density(sub):
         help="Run identifier.",
     )
     p.add_argument(
-        "--threshold", type=float, default=density_mod.DEFAULT_THRESHOLD,
+        "--threshold", type=float, default=None,
         help=f"Minimum postcode Probability for a spot to be counted. "
              f"(default: {density_mod.DEFAULT_THRESHOLD})",
+    )
+    p.add_argument(
+        "-Q", "--quality", type=int, default=None,
+        help="Phred quality score (Q20=0.99, Q30=0.999). "
+             "Overrides --threshold and uses density_Q<N> directory naming.",
     )
     p.add_argument(
         "--fac", type=int, default=density_mod.DEFAULT_FAC,
         help=f"Downsample factor; output resolution is (H/fac, W/fac). "
              f"(default: {density_mod.DEFAULT_FAC})",
     )
+    p.add_argument(
+        "--ref-file", type=str, default=None,
+        help="Codebook CSV; genes in the codebook but absent from mapping data "
+             "are written as all-black (zero) density TIFs.",
+    )
     p.set_defaults(_func=_run_density)
 
 
 def _run_density(args):
-    density_mod.run_pipeline(args.run_id, threshold=args.threshold, fac=args.fac)
+    threshold = args.threshold if args.threshold is not None else density_mod.DEFAULT_THRESHOLD
+    prob, label = resolve_threshold_and_label(threshold, args.quality)
+    density_mod.run_pipeline(args.run_id, threshold=prob, fac=args.fac,
+                             ref_file=args.ref_file, density_label=label)
+
+
+def _build_density_stack(sub):
+    p = sub.add_parser(
+        "density-stack",
+        help="Composite density stack TIFF with thermal LUT.",
+        description=(
+            "Post-processing step: reads per-gene density TIFFs from "
+            "readout/density_<threshold>/, applies Gaussian blur, and writes a "
+            "single multi-page TIFF with embedded thermal colormap and display range.\n\n"
+            "The output opens in ImageJ with the correct LUT and brightness already set."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  # Stack genes from a text file:\n"
+            "  sprintseq density-stack --run-id 20260402_... --gene-file marker_genes.txt\n\n"
+            "  # Stack all density TIFs:\n"
+            "  sprintseq density-stack --run-id 20260402_... --all\n\n"
+            "  # Custom blur and display range:\n"
+            "  sprintseq density-stack --run-id 20260402_... --all --sigma 1.0 --display-max 20"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--run-id", type=str, required=True,
+        help="Run identifier.",
+    )
+    grp = p.add_mutually_exclusive_group(required=True)
+    grp.add_argument(
+        "--gene-file", type=str,
+        help="Text file with one gene name per line.",
+    )
+    grp.add_argument(
+        "--all", dest="use_all", action="store_true",
+        help="Use all density TIFs in the directory.",
+    )
+    p.add_argument(
+        "--threshold", type=float, default=None,
+        help=f"Density subdirectory threshold suffix. (default: {ds_mod.DEFAULT_THRESHOLD})",
+    )
+    p.add_argument(
+        "-Q", "--quality", type=int, default=None,
+        help="Phred quality score; reads from density_Q<N>/ directory.",
+    )
+    p.add_argument(
+        "--output", type=str, default=None,
+        help="Output filename (written to readout/). Auto-generated if omitted.",
+    )
+    p.add_argument(
+        "--sigma", type=float, default=ds_mod.DEFAULT_SIGMA,
+        help=f"Gaussian blur sigma. (default: {ds_mod.DEFAULT_SIGMA})",
+    )
+    p.add_argument(
+        "--display-min", type=float, default=ds_mod.DEFAULT_DISPLAY_MIN,
+        help=f"ImageJ display range minimum. (default: {ds_mod.DEFAULT_DISPLAY_MIN})",
+    )
+    p.add_argument(
+        "--display-max", type=float, default=ds_mod.DEFAULT_DISPLAY_MAX,
+        help=f"ImageJ display range maximum. (default: {ds_mod.DEFAULT_DISPLAY_MAX})",
+    )
+    p.add_argument(
+        "--sort", action="store_true",
+        help="Sort genes alphabetically. Default: preserve gene-file / codebook order.",
+    )
+    p.set_defaults(_func=_run_density_stack)
+
+
+def _run_density_stack(args):
+    threshold = args.threshold if args.threshold is not None else ds_mod.DEFAULT_THRESHOLD
+    _, label = resolve_threshold_and_label(threshold, args.quality)
+    ds_mod.run_pipeline(
+        args.run_id, density_label=label,
+        gene_file=args.gene_file, use_all=args.use_all, output=args.output,
+        sigma=args.sigma, display_min=args.display_min, display_max=args.display_max,
+        sort=args.sort,
+    )
 
 
 def _build_segment(sub):
@@ -299,20 +389,23 @@ def main():
             "  readout         Spot detection + intensity readout.\n"
             "  gene-calling    Gene mapping (postcode / threshold / ...).\n"
             "  density         Per-gene density TIFFs.\n"
+            "  density-stack   Composite density stack with thermal LUT.\n"
             "  segment         Cell segmentation + RNA-to-cell assignment.\n\n"
             "Example end-to-end:\n"
             "  sprintseq readout       --run-id <id>\n"
             "  sprintseq gene-calling  --run-id <id> --ref-file <codebook.csv>\n"
             "  sprintseq density       --run-id <id>\n"
+            "  sprintseq density-stack --run-id <id> --gene-file markers.txt\n"
             "  sprintseq segment       --run-id <id> --model <validated-model>\n"
         ),
     )
     sub = parser.add_subparsers(dest="command",
-                                metavar="{readout,gene-calling,density,segment}")
+                                metavar="{readout,gene-calling,density,density-stack,segment}")
 
     _build_readout(sub)
     _build_gene_calling(sub)
     _build_density(sub)
+    _build_density_stack(sub)
     _build_segment(sub)
 
     args = parser.parse_args()
