@@ -272,15 +272,18 @@ def detect_all_spots(
 
     if not results:
         logger.warning("No spots detected in any channel!")
-        return np.empty((0, 2), dtype=np.float64)
+        detection_stats = {"per_channel": {}, "total_raw": 0, "total_after_exact_dedup": 0}
+        return np.empty((0, 2), dtype=np.float64), detection_stats
 
     # Log per-channel counts (before exact-duplicate removal)
+    per_channel_counts = {}
     coords_by_channel = defaultdict(list)
     for channel, coords in results:
         coords_by_channel[channel].append(coords)
     for channel in channels:
         if channel in coords_by_channel:
             ch_coords = np.vstack(coords_by_channel[channel])
+            per_channel_counts[channel] = len(ch_coords)
             logger.info(f"  {channel}: {len(ch_coords)} spots detected (raw, before dedup)")
 
     # Combine and remove exact duplicates
@@ -291,7 +294,12 @@ def detect_all_spots(
     unique_coords = all_coords[unique_indices]
     logger.info(f"Total coordinates after removing exact duplicates: {len(unique_coords)}")
 
-    return unique_coords
+    detection_stats = {
+        "per_channel": per_channel_counts,
+        "total_raw": len(all_coords),
+        "total_after_exact_dedup": len(unique_coords),
+    }
+    return unique_coords, detection_stats
 
 
 def read_all_intensities(
@@ -478,7 +486,7 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     logger.info("=" * 80)
     logger.info("Stage 1: Spot Detection")
     logger.info("=" * 80)
-    unique_coords = detect_all_spots(
+    unique_coords, detection_stats = detect_all_spots(
         stc_dir,
         channels=channels,
         detection_cycles=detection_cycles,
@@ -512,13 +520,15 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     logger.info("=" * 80)
     logger.info("Stage 3: Conservative Filtering")
     logger.info("=" * 80)
+    n_before_filter = len(intensity_df)
+    n_after_filter = n_before_filter
     if MIN_INTENSITY_THRESHOLD > 0:
         intensity_cols = [c for c in intensity_df.columns if c.startswith('cyc_')]
         intensity_max = intensity_df[intensity_cols].max(axis=1)
-        n_before = len(intensity_df)
+        n_before_filter = len(intensity_df)
         intensity_df = intensity_df[intensity_max >= MIN_INTENSITY_THRESHOLD].copy()
-        n_after = len(intensity_df)
-        logger.info(f"Filtered: {n_before} -> {n_after} spots (threshold={MIN_INTENSITY_THRESHOLD})")
+        n_after_filter = len(intensity_df)
+        logger.info(f"Filtered: {n_before_filter} -> {n_after_filter} spots (threshold={MIN_INTENSITY_THRESHOLD})")
     else:
         logger.info("Filtering disabled (threshold=0)")
 
@@ -568,6 +578,27 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     intensity_file = read_dir / 'intensity.csv'
     intensity_output_df.to_csv(intensity_file, index=False)
     logger.info(f"Saved intensity: {intensity_file} ({len(intensity_output_df)} spots)")
+
+    # Stage 6: QC
+    logger.info("=" * 80)
+    logger.info("Stage 6: QC Report")
+    logger.info("=" * 80)
+    try:
+        from sprintseq.qc import generate_readout_qc
+        generate_readout_qc(
+            intensity_df=intensity_df,
+            position_df=position_df,
+            output_dir=read_dir,
+            run_id=run_id,
+            channels=channels,
+            seq_cycle=seq_cycle,
+            detection_stats=detection_stats,
+            filter_stats={"n_before": n_before_filter, "n_after": n_after_filter, "threshold": MIN_INTENSITY_THRESHOLD},
+            dedup_stats={"n_before": n_before_dedup, "n_after": n_after_dedup},
+        )
+        logger.info(f"  readout_qc.json + readout_qc.png saved to {read_dir}")
+    except Exception as e:
+        logger.warning(f"QC generation failed (non-fatal): {e}")
 
     logger.info("=" * 80)
     logger.info("Readout pipeline completed successfully!")
