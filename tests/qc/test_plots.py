@@ -33,6 +33,7 @@ def readout_qc_inputs():
 def gene_calling_qc_inputs(synthetic_mapping_result):
     from sprintseq.qc.metrics import compute_gene_calling_metrics
     metrics = compute_gene_calling_metrics(synthetic_mapping_result)
+    metrics["convergence"] = {"losses": [], "converged": False, "n_iterations": 0, "final_loss": None}
     prob = synthetic_mapping_result["Probability"].to_numpy()
     entropy = synthetic_mapping_result["Entropy"].to_numpy()
     return metrics, prob, entropy, synthetic_mapping_result
@@ -66,13 +67,13 @@ class TestPlotReadoutQC:
 class TestPlotGeneCallingQC:
     def test_returns_figure(self, gene_calling_qc_inputs):
         metrics, prob, entropy, df = gene_calling_qc_inputs
-        fig = plot_gene_calling_qc(metrics, prob, entropy, df, 0.9, 0.8)
+        fig = plot_gene_calling_qc(metrics, prob, entropy, df)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
     def test_axes_count(self, gene_calling_qc_inputs):
         metrics, prob, entropy, df = gene_calling_qc_inputs
-        fig = plot_gene_calling_qc(metrics, prob, entropy, df, 0.9, 0.8)
+        fig = plot_gene_calling_qc(metrics, prob, entropy, df)
         assert len(fig.axes) >= 9
         plt.close(fig)
 
@@ -87,8 +88,9 @@ class TestPlotGeneCallingQC:
             "Entropy": np.full(n, 0.5),
         })
         metrics = compute_gene_calling_metrics(df)
+        metrics["convergence"] = {"losses": [], "converged": False, "n_iterations": 0, "final_loss": None}
         fig = plot_gene_calling_qc(
-            metrics, df["Probability"].values, df["Entropy"].values, df, 0.9, 0.8
+            metrics, df["Probability"].values, df["Entropy"].values, df
         )
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
