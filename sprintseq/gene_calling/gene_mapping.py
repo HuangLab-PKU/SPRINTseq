@@ -1644,7 +1644,12 @@ def postcode_mapping(intensity_df, ref_file, cyc_num=10, channels=['cy3', 'cy5']
         print(f"  Average Entropy: {result_df['Entropy'].mean():.3f}")
 
     if return_diagnostics:
-        diagnostics = {'losses': losses}
+        diagnostics = {
+            'losses': losses,
+            'w_star': w_star.cpu().numpy().tolist(),
+            'n_training_spots': len(ind_keep),
+            'n_total_spots': N,
+        }
         return result_df, diagnostics
         
     return result_df

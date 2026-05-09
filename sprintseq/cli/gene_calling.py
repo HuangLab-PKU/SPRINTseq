@@ -5,133 +5,6 @@ import pandas as pd
 
 from sprintseq.gene_calling import correct_intensity, map_genes
 
-
-def plot_mapping_qc(mapping_result, output_path, method_name='postcode',
-                    prob_high=0.9, prob_mid=0.8):
-    """Plot QC summary for a mapping result into a single composite figure.
-
-    Combines the diagnostic plots from inspect_readout.ipynb:
-    - Probability distribution (all spots)
-    - Entropy distribution (all spots)
-    - Probability vs Entropy 2D density
-    - Entropy distribution for high-probability subset (Prob > prob_mid)
-    - Cumulative pass rate vs probability threshold
-    - Top mapped gene counts (high-confidence subset, Prob > prob_high)
-
-    Parameters
-    ----------
-    mapping_result : pd.DataFrame
-        DataFrame returned by map_genes (must contain 'Gene', 'Probability',
-        and 'Entropy' columns for postcode output).
-    output_path : str or Path
-        Where to save the resulting PNG figure.
-    method_name : str
-        Method name (used in figure title).
-    prob_high : float
-        High-confidence probability threshold.
-    prob_mid : float
-        Medium-confidence probability threshold (used for entropy subset).
-    """
-    import matplotlib.pyplot as plt
-
-    required_cols = {'Probability', 'Entropy', 'Gene'}
-    missing = required_cols - set(mapping_result.columns)
-    if missing:
-        print(f"    ! Skipping QC plot, missing columns: {missing}")
-        return
-
-    prob = mapping_result['Probability'].to_numpy()
-    entropy = mapping_result['Entropy'].to_numpy()
-    total = len(mapping_result)
-    n_high = int((prob > prob_high).sum())
-    n_mid = int((prob > prob_mid).sum())
-
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(
-        f'Mapping QC ({method_name}) - {total:,} spots  |  '
-        f'Prob>{prob_high}: {n_high:,} ({n_high / total * 100:.1f}%)  |  '
-        f'Prob>{prob_mid}: {n_mid:,} ({n_mid / total * 100:.1f}%)',
-        fontsize=14,
-    )
-
-    # (1) Probability histogram
-    ax = axes[0, 0]
-    ax.hist(prob, bins=100, color='steelblue', edgecolor='none')
-    ax.axvline(prob_high, color='red', linestyle='--', alpha=0.7,
-               label=f'Prob = {prob_high}')
-    ax.axvline(prob_mid, color='orange', linestyle='--', alpha=0.7,
-               label=f'Prob = {prob_mid}')
-    ax.set_xlabel('Probability')
-    ax.set_ylabel('Count')
-    ax.set_title('Probability distribution (all spots)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # (2) Entropy histogram
-    ax = axes[0, 1]
-    ax.hist(entropy, bins=100, color='seagreen', edgecolor='none')
-    ax.set_xlabel('Entropy')
-    ax.set_ylabel('Count')
-    ax.set_title('Entropy distribution (all spots)')
-    ax.grid(True, alpha=0.3)
-
-    # (3) 2D density: Probability vs Entropy
-    ax = axes[0, 2]
-    h = ax.hist2d(prob, entropy, bins=100, cmap='viridis',
-                  cmin=1)
-    ax.set_xlabel('Probability')
-    ax.set_ylabel('Entropy')
-    ax.set_title('Probability vs Entropy')
-    fig.colorbar(h[3], ax=ax, label='Count')
-
-    # (4) Entropy distribution for Probability > prob_mid
-    ax = axes[1, 0]
-    mask_mid = prob > prob_mid
-    if mask_mid.any():
-        ax.hist(entropy[mask_mid], bins=100, color='darkorange',
-                edgecolor='none')
-    ax.set_xlabel('Entropy')
-    ax.set_ylabel('Count')
-    ax.set_title(f'Entropy distribution (Prob > {prob_mid})')
-    ax.grid(True, alpha=0.3)
-
-    # (5) Cumulative pass rate vs probability threshold
-    ax = axes[1, 1]
-    thresholds = np.linspace(0.0, 1.0, 101)
-    pass_rate = [(prob > t).mean() * 100 for t in thresholds]
-    ax.plot(thresholds, pass_rate, color='purple', linewidth=2)
-    ax.axvline(prob_high, color='red', linestyle='--', alpha=0.7,
-               label=f'Prob > {prob_high}: {n_high / total * 100:.1f}%')
-    ax.axvline(prob_mid, color='orange', linestyle='--', alpha=0.7,
-               label=f'Prob > {prob_mid}: {n_mid / total * 100:.1f}%')
-    ax.set_xlabel('Probability threshold')
-    ax.set_ylabel('Spots passing (%)')
-    ax.set_title('Cumulative pass rate vs threshold')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # (6) Top genes (high-confidence subset)
-    ax = axes[1, 2]
-    high_subset = mapping_result.loc[mask_mid & mapping_result['Gene'].notna(),
-                                     'Gene']
-    if len(high_subset) > 0:
-        top_genes = high_subset.value_counts().head(20)
-        ax.barh(range(len(top_genes)), top_genes.values[::-1],
-                color='teal')
-        ax.set_yticks(range(len(top_genes)))
-        ax.set_yticklabels(top_genes.index[::-1], fontsize=8)
-        ax.set_xlabel('Count')
-        ax.set_title(f'Top 20 genes (Prob > {prob_mid})')
-    else:
-        ax.text(0.5, 0.5, 'No high-confidence spots',
-                ha='center', va='center', transform=ax.transAxes)
-        ax.set_title(f'Top genes (Prob > {prob_mid})')
-    ax.grid(True, alpha=0.3, axis='x')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(output_path, dpi=200, bbox_inches='tight')
-    plt.close(fig)
-
 # basic paths
 BASE_DIR = Path(r'\\10.10.10.1\NAS Processed Images')
 
@@ -516,38 +389,20 @@ def run_pipeline(run_id=None, ref_file=None, seq_cycle=None, channels=None):
                 saved_files.append(mapping_output_path)
                 print(f"    ✓ Saved to: {mapping_output_path}")
                 
-                # Plot diagnostics (Convergence Curve) for PoSTcode
-                if method == 'postcode' and 'losses' in diagnostics:
-                    losses = diagnostics['losses']
-                    if len(losses) > 0:
-                        print(f"    Generating convergence plot ({len(losses)} iter)...")
-                        try:
-                            import matplotlib.pyplot as plt
-                            plt.figure(figsize=(10, 6))
-                            plt.plot(losses, marker='o', linestyle='-', markersize=3, alpha=0.7)
-                            plt.title(f'PoSTcode Convergence (ELBO Loss) - Full Run')
-                            plt.xlabel('Iteration')
-                            plt.ylabel('Loss (ELBO)')
-                            plt.grid(True, alpha=0.3)
-                            
-                            # Save plot
-                            plot_file = read_dir / f'convergence_{method_name}.png'
-                            plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-                            plt.close()
-                            print(f"    ✓ Plot saved to: {plot_file}")
-                        except Exception as e:
-                            print(f"    ! Could not generate plot: {e}")
-
-                # QC plot for postcode (composite figure with probability/entropy diagnostics)
+                # QC report (JSON + 3x3 composite PNG, replaces old convergence + mapping_qc PNGs)
                 if method == 'postcode':
-                    qc_plot_file = read_dir / f'mapping_qc_{method_name}.png'
-                    print(f"    Generating QC summary figure...")
+                    print(f"    Generating QC report...")
                     try:
-                        plot_mapping_qc(mapping_result, qc_plot_file,
-                                        method_name=method_name)
-                        print(f"    ✓ QC plot saved to: {qc_plot_file}")
+                        from sprintseq.qc import generate_gene_calling_qc
+                        generate_gene_calling_qc(
+                            result_df=mapping_result,
+                            output_dir=read_dir,
+                            run_id=run_id,
+                            diagnostics=diagnostics,
+                        )
+                        print(f"    ✓ gene_calling_qc.json + gene_calling_qc.png saved to {read_dir}")
                     except Exception as e:
-                        print(f"    ! Could not generate QC plot: {e}")
+                        print(f"    ! QC generation failed (non-fatal): {e}")
                         import traceback
                         traceback.print_exc()
 
