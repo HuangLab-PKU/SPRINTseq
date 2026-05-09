@@ -182,13 +182,13 @@ def _build_density(sub):
     )
     p.add_argument(
         "--threshold", type=float, default=None,
-        help=f"Minimum postcode Probability for a spot to be counted. "
-             f"(default: {density_mod.DEFAULT_THRESHOLD})",
+        help="Minimum postcode Probability for a spot to be counted. "
+             "Overrides -Q when set explicitly.",
     )
     p.add_argument(
         "-Q", "--quality", type=int, default=None,
-        help="Phred quality score (Q20=0.99, Q30=0.999). "
-             "Overrides --threshold and uses density_Q<N> directory naming.",
+        help=f"Phred quality score (Q20=0.99, Q30=0.999). "
+             f"(default: Q{density_mod.DEFAULT_QUALITY})",
     )
     p.add_argument(
         "--fac", type=int, default=density_mod.DEFAULT_FAC,
@@ -204,8 +204,10 @@ def _build_density(sub):
 
 
 def _run_density(args):
-    threshold = args.threshold if args.threshold is not None else density_mod.DEFAULT_THRESHOLD
-    prob, label = resolve_threshold_and_label(threshold, args.quality)
+    quality = args.quality if args.quality is not None else (
+        density_mod.DEFAULT_QUALITY if args.threshold is None else None)
+    prob, label = resolve_threshold_and_label(
+        args.threshold or density_mod.DEFAULT_THRESHOLD, quality)
     density_mod.run_pipeline(args.run_id, threshold=prob, fac=args.fac,
                              ref_file=args.ref_file, density_label=label)
 
@@ -276,8 +278,10 @@ def _build_density_stack(sub):
 
 
 def _run_density_stack(args):
-    threshold = args.threshold if args.threshold is not None else ds_mod.DEFAULT_THRESHOLD
-    _, label = resolve_threshold_and_label(threshold, args.quality)
+    quality = args.quality if args.quality is not None else (
+        ds_mod.DEFAULT_QUALITY if args.threshold is None else None)
+    _, label = resolve_threshold_and_label(
+        args.threshold or ds_mod.DEFAULT_THRESHOLD, quality)
     ds_mod.run_pipeline(
         args.run_id, density_label=label,
         gene_file=args.gene_file, use_all=args.use_all, output=args.output,

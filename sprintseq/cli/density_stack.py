@@ -20,7 +20,8 @@ from tifffile import imread, imwrite
 logger = logging.getLogger(__name__)
 
 BASE_DEST_DIRECTORY = r'\\10.10.10.1\NAS Processed Images'
-DEFAULT_THRESHOLD = 0.95
+DEFAULT_QUALITY = 20
+DEFAULT_THRESHOLD = 0.99  # Q20
 DEFAULT_SIGMA = 0.7
 DEFAULT_DISPLAY_MIN = 1.0
 DEFAULT_DISPLAY_MAX = 10.0
@@ -222,8 +223,10 @@ def main():
     args = parser.parse_args()
 
     from sprintseq.cli import resolve_threshold_and_label
-    threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD
-    _, label = resolve_threshold_and_label(threshold, args.quality)
+    quality = args.quality if args.quality is not None else (
+        DEFAULT_QUALITY if args.threshold is None else None)
+    _, label = resolve_threshold_and_label(
+        args.threshold or DEFAULT_THRESHOLD, quality)
     run_pipeline(
         args.run_id, density_label=label,
         gene_file=args.gene_file, use_all=args.use_all, output=args.output,
