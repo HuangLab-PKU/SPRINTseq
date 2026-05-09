@@ -99,8 +99,6 @@ def generate_gene_calling_qc(
     output_dir,
     run_id: str,
     diagnostics: dict = None,
-    prob_high: float = 0.9,
-    prob_mid: float = 0.8,
 ) -> Path:
     """Generate gene-calling QC JSON report + PNG figure."""
     import matplotlib.pyplot as plt
@@ -142,7 +140,7 @@ def generate_gene_calling_qc(
 
     prob = np.nan_to_num(result_df["Probability"].to_numpy(dtype=np.float64), nan=0.0) if len(result_df) > 0 else np.array([])
     entropy = np.nan_to_num(result_df["Entropy"].to_numpy(dtype=np.float64), nan=0.0) if len(result_df) > 0 else np.array([])
-    fig = plot_gene_calling_qc(metrics, prob, entropy, result_df, prob_high, prob_mid)
+    fig = plot_gene_calling_qc(metrics, prob, entropy, result_df)
     fig.savefig(output_dir / "gene_calling_qc.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 

@@ -143,45 +143,66 @@ def plot_readout_qc(
     return fig
 
 
+def _q_to_prob(q):
+    """Convert Phred Q-score to probability: P = 1 - 10^(-Q/10)."""
+    return 1.0 - 10.0 ** (-q / 10.0)
+
+
 def plot_gene_calling_qc(
     metrics: dict,
     prob: np.ndarray,
     entropy: np.ndarray,
     result_df: pd.DataFrame,
-    prob_high: float = 0.9,
-    prob_mid: float = 0.8,
+    q_loose: int = 13,
+    q_standard: int = 20,
+    q_strict: int = 30,
 ):
-    """3x3 gene-calling QC composite. Panels 1-6 match the old plot_mapping_qc,
-    panels 7-9 are new Xenium-inspired additions.
+    """3x3 gene-calling QC composite using Q-score thresholds.
+
+    Parameters
+    ----------
+    q_loose : int
+        Loose Q threshold (Q13 ≈ P≥0.95). Shown in title.
+    q_standard : int
+        Standard Q threshold (Q20 = P≥0.99). Used for top-gene filtering.
+    q_strict : int
+        Strict Q threshold (Q30 = P≥0.999). Shown in title.
     """
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
+
+    p_loose = _q_to_prob(q_loose)
+    p_standard = _q_to_prob(q_standard)
+    p_strict = _q_to_prob(q_strict)
 
     # Filter NaN from prob/entropy for plotting
     prob = np.where(np.isfinite(prob), prob, 0.0)
     entropy = np.where(np.isfinite(entropy), entropy, 0.0)
     total = len(prob)
-    n_high = int((prob > prob_high).sum()) if total > 0 else 0
-    n_mid = int((prob > prob_mid).sum()) if total > 0 else 0
+    n_loose = int((prob >= p_loose).sum()) if total > 0 else 0
+    n_std = int((prob >= p_standard).sum()) if total > 0 else 0
+    n_strict = int((prob >= p_strict).sum()) if total > 0 else 0
 
     fig, axes = plt.subplots(3, 3, figsize=(20, 16))
     title = (
         f'Gene Calling QC — {total:,} spots  |  '
-        f'Prob>{prob_high}: {n_high:,} ({n_high / total * 100:.1f}%)  |  '
-        f'Prob>{prob_mid}: {n_mid:,} ({n_mid / total * 100:.1f}%)'
+        f'Q{q_loose}: {n_loose:,} ({n_loose / total * 100:.1f}%)  |  '
+        f'Q{q_standard}: {n_std:,} ({n_std / total * 100:.1f}%)  |  '
+        f'Q{q_strict}: {n_strict:,} ({n_strict / total * 100:.1f}%)'
         if total > 0
         else "Gene Calling QC — 0 spots"
     )
     fig.suptitle(title, fontsize=13)
 
-    # (1) Probability histogram — log y
+    # (1) Probability histogram — log y, with Q-score threshold lines
     ax = axes[0, 0]
     if total > 0:
         ax.hist(prob, bins=100, color="steelblue", edgecolor="none")
-        ax.axvline(prob_high, color="red", linestyle="--", alpha=0.7, label=f"P={prob_high}")
-        ax.axvline(prob_mid, color="orange", linestyle="--", alpha=0.7, label=f"P={prob_mid}")
+        ax.axvline(p_loose, color="orange", linestyle="--", alpha=0.7, label=f"Q{q_loose} (P≥{p_loose:.2f})")
+        ax.axvline(p_standard, color="red", linestyle="--", alpha=0.7, label=f"Q{q_standard} (P≥{p_standard})")
+        ax.axvline(p_strict, color="darkred", linestyle="--", alpha=0.7, label=f"Q{q_strict} (P≥{p_strict})")
         ax.set_yscale("log")
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=7)
     ax.set_xlabel("Probability")
     ax.set_ylabel("Count")
     ax.set_title("Probability distribution")
@@ -207,9 +228,8 @@ def plot_gene_calling_qc(
     ax.set_ylabel("Entropy")
     ax.set_title("Probability vs Entropy")
 
-    # (4) Convergence (ELBO loss) — replaces old Entropy(P>prob_mid) panel
+    # (4) Convergence (ELBO loss)
     ax = axes[1, 0]
-    mask_mid = prob > prob_mid
     losses = metrics.get("convergence", {}).get("losses", [])
     if losses:
         ax.plot(range(1, len(losses) + 1), losses, color="steelblue", linewidth=1.5,
@@ -225,28 +245,31 @@ def plot_gene_calling_qc(
         ax.set_title("PoSTcode ELBO")
     ax.grid(True, alpha=0.3)
 
-    # (5) Cumulative pass rate
+    # (5) Cumulative pass rate — with Q-score threshold lines
     ax = axes[1, 1]
     if total > 0:
         thresholds = np.linspace(0.0, 1.0, 101)
-        pass_rate = [(prob > t).mean() * 100 for t in thresholds]
+        pass_rate = [(prob >= t).mean() * 100 for t in thresholds]
         ax.plot(thresholds, pass_rate, color="purple", linewidth=2)
-        ax.axvline(prob_high, color="red", linestyle="--", alpha=0.7,
-                   label=f"P>{prob_high}: {n_high / total * 100:.1f}%")
-        ax.axvline(prob_mid, color="orange", linestyle="--", alpha=0.7,
-                   label=f"P>{prob_mid}: {n_mid / total * 100:.1f}%")
-        ax.legend(fontsize=8)
+        ax.axvline(p_loose, color="orange", linestyle="--", alpha=0.7,
+                   label=f"Q{q_loose}: {n_loose / total * 100:.1f}%")
+        ax.axvline(p_standard, color="red", linestyle="--", alpha=0.7,
+                   label=f"Q{q_standard}: {n_std / total * 100:.1f}%")
+        ax.axvline(p_strict, color="darkred", linestyle="--", alpha=0.7,
+                   label=f"Q{q_strict}: {n_strict / total * 100:.1f}%")
+        ax.legend(fontsize=7)
     ax.set_xlabel("Probability threshold")
     ax.set_ylabel("Spots passing (%)")
     ax.set_title("Cumulative pass rate")
     ax.grid(True, alpha=0.3)
 
-    # (6) Top 20 genes
+    # (6) Top 20 genes — filtered by Q≥q_standard (P≥0.99)
     ax = axes[1, 2]
+    mask_std = prob >= p_standard
     if total > 0:
         gene_col = result_df["Gene"]
         high_genes = result_df.loc[
-            mask_mid & gene_col.notna()
+            mask_std & gene_col.notna()
             & ~gene_col.isin(["Background", "Infeasible"]),
             "Gene",
         ]
@@ -256,11 +279,11 @@ def plot_gene_calling_qc(
             ax.set_yticks(range(len(top)))
             ax.set_yticklabels(top.index[::-1], fontsize=8)
             ax.set_xlabel("Count")
-            ax.set_title(f"Top 20 genes (Prob > {prob_mid})")
+            ax.set_title(f"Top 20 genes (Q≥{q_standard})")
         else:
             ax.text(0.5, 0.5, "No high-confidence gene spots",
                     ha="center", va="center", transform=ax.transAxes)
-            ax.set_title(f"Top genes (Prob > {prob_mid})")
+            ax.set_title(f"Top genes (Q≥{q_standard})")
     else:
         ax.text(0.5, 0.5, "No spots", ha="center", va="center", transform=ax.transAxes)
     ax.grid(True, alpha=0.3, axis="x")
