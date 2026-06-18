@@ -53,15 +53,16 @@ DETECTION_CYCLES = [1, 2, 3, 4]
 SNRS = {'cy3': 3.0, 'cy5': 3.0}
 DETECTION_METHOD = 'spotiflow'
 
-# Spotiflow defaults. Set during run 6 iter6 (2026-04-25) on the BZ29 TNBC
-# marker panel: hybiss recovers ~+90 % weak cy3 spots vs `general`, and
-# prob_thresh=0.1 is intentionally permissive — postcode downstream filters
-# noise via Background/Infeasible classes. Re-tune per panel using
+# Spotiflow defaults. hybiss recovers ~+90 % weak cy3 spots vs `general`
+# (established run 6 iter6, 2026-04-25, BZ29 TNBC marker panel). prob_thresh
+# is intentionally very permissive — postcode downstream filters noise via
+# Background/Infeasible classes. hybiss + prob_thresh=0.01 is the standing
+# readout default (set 2026-05-30). Re-tune per panel using
 # experiments/notebooks/readout_spotiflow_test.ipynb before each new run and
 # overwrite these two values; they are the single source of truth for the
 # pipeline's Spotiflow config.
 SPOTIFLOW_PRETRAINED_NAME = 'hybiss'
-SPOTIFLOW_PROB_THRESH = 0.1
+SPOTIFLOW_PROB_THRESH = 0.01
 
 # Intensity readout — sequencing cycles are consecutive 1..SEQ_CYCLE
 SEQ_CYCLE = 10
@@ -172,6 +173,26 @@ def _get_stitched_image_path(stc_dir, cyc, channel):
     return Path(stc_dir) / f'cyc_{cyc}_{channel}.tif'
 
 
+def _filter_coords_by_coverage(coords, mask, downsample=16):
+    """Keep only (Y, X) coords that fall inside a boolean coverage mask.
+
+    Generic gate for multi-cycle co-decoding: when cycles are imaged over different
+    footprints (e.g. cyc1 brain-only, cyc2 full-slide), spots outside the cycle-coverage
+    intersection have missing-cycle intensities ~0 and decode to false codes. `mask` is a
+    2-D boolean array downsampled by `downsample`; keep = mask[Y//d, X//d] (edge-clipped).
+    `mask=None` (or empty coords) is a no-op. Returns (kept_coords, keep_bool).
+    """
+    keep = np.ones(len(coords), dtype=bool)
+    if mask is None or len(coords) == 0:
+        return coords, keep
+    mask = np.asarray(mask, dtype=bool)
+    h, w = mask.shape
+    yi = np.clip(coords[:, 0].astype(np.int64) // downsample, 0, h - 1)
+    xi = np.clip(coords[:, 1].astype(np.int64) // downsample, 0, w - 1)
+    keep = mask[yi, xi]
+    return coords[keep], keep
+
+
 def detect_all_spots(
     stc_dir,
     channels=CHANNELS,
@@ -181,6 +202,8 @@ def detect_all_spots(
     detection_method=DETECTION_METHOD,
     snrs=SNRS,
     n_workers=N_WORKERS,
+    coverage_mask=None,
+    coverage_downsample=16,
 ):
     """Stage 1: Detect spots across detection cycles/channels from stitched images.
 
@@ -197,6 +220,12 @@ def detect_all_spots(
         Explicit list of cycle numbers to detect in. Defaults to `DETECTION_CYCLES`
         (= [1, 2, 3, 4]). Use e.g. `[11]` when your protocol stains every spot in a
         single dedicated cycle, or `[1, 2, 3, 4, 11]` to union both strategies.
+    coverage_mask : np.ndarray | None
+        Optional 2-D boolean coverage mask (downsampled by `coverage_downsample`). When
+        given, detected coordinates outside the imaged-region intersection are dropped
+        (keep = mask[Y//d, X//d]). For multi-cycle co-decoding where cycles span different
+        footprints (e.g. VS200 cyc1 brain-only vs cyc2 full-slide); see
+        `_filter_coords_by_coverage`. Default None = no gating (standard SBS behavior).
 
     Returns
     -------
@@ -299,6 +328,18 @@ def detect_all_spots(
         "total_raw": len(all_coords),
         "total_after_exact_dedup": len(unique_coords),
     }
+
+    if coverage_mask is not None:
+        n_before = len(unique_coords)
+        unique_coords, _keep = _filter_coords_by_coverage(
+            unique_coords, coverage_mask, coverage_downsample)
+        detection_stats["coverage_kept"] = len(unique_coords)
+        detection_stats["coverage_dropped"] = n_before - len(unique_coords)
+        logger.info(
+            f"Coverage gate: {n_before} -> {len(unique_coords)} "
+            f"({detection_stats['coverage_dropped']} dropped outside cycle-coverage intersection)"
+        )
+
     return unique_coords, detection_stats
 
 
@@ -424,7 +465,8 @@ def read_all_intensities(
 
 
 def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
-                 channels=None, detection_method=None):
+                 channels=None, detection_method=None,
+                 coverage_mask=None, coverage_downsample=16):
     """Main entry point for stitched-image readout pipeline.
 
     Parameters
@@ -495,6 +537,8 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
         detection_method=detection_method,
         snrs=SNRS,
         n_workers=n_workers,
+        coverage_mask=coverage_mask,
+        coverage_downsample=coverage_downsample,
     )
     if len(unique_coords) == 0:
         logger.warning("No spots detected. Exiting.")

@@ -295,6 +295,60 @@ class TestEndToEnd:
             assert list(inten.columns) == expected_cols
 
 
+class TestFilterCoordsByCoverage:
+    """Generic cyc1∩cyc2 coverage hook (_filter_coords_by_coverage) — pure-function unit tests."""
+
+    def test_keeps_inside_drops_outside(self):
+        from sprintseq.cli.readout import _filter_coords_by_coverage
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[:, :2] = True                              # left half (X//4 in {0,1}) imaged
+        coords = np.array([[2.0, 2.0], [2.0, 10.0]])    # X=2 -> bin 0 (keep); X=10 -> bin 2 (drop)
+        kept, keep = _filter_coords_by_coverage(coords, mask, downsample=4)
+        assert keep.tolist() == [True, False]
+        assert len(kept) == 1 and kept[0, 1] == 2.0
+
+    def test_none_mask_is_noop(self):
+        from sprintseq.cli.readout import _filter_coords_by_coverage
+        coords = np.array([[1.0, 2.0], [3.0, 4.0]])
+        kept, keep = _filter_coords_by_coverage(coords, None, downsample=4)
+        assert np.array_equal(kept, coords) and keep.all()
+
+    def test_edge_coords_are_clipped(self):
+        from sprintseq.cli.readout import _filter_coords_by_coverage
+        mask = np.ones((2, 2), dtype=bool)
+        coords = np.array([[100.0, 100.0]])             # //4 -> (25,25), clipped to (1,1)
+        _, keep = _filter_coords_by_coverage(coords, mask, downsample=4)
+        assert keep.tolist() == [True]
+
+    def test_empty_coords(self):
+        from sprintseq.cli.readout import _filter_coords_by_coverage
+        kept, keep = _filter_coords_by_coverage(
+            np.empty((0, 2)), np.ones((2, 2), dtype=bool), downsample=4)
+        assert len(kept) == 0 and len(keep) == 0
+
+
+class TestDetectAllSpotsCoverage:
+    """detect_all_spots applies an optional coverage_mask after exact-dedup (n_workers=1)."""
+
+    def test_coverage_mask_drops_out_of_region(self):
+        from sprintseq.cli.readout import detect_all_spots
+        height, width = 256, 256
+        spots = [(50, 30, 60000), (60, 40, 60000),      # left half  -> kept
+                 (50, 220, 60000), (60, 210, 60000)]    # right half -> dropped
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            stc_dir = _setup_stitched_dir(tmp_dir, height, width, ['cy3'], 1, spots=spots)
+            mask = np.zeros((16, 16), dtype=bool); mask[:, :8] = True   # left half imaged
+            coords, stats = detect_all_spots(
+                stc_dir, channels=['cy3'], detection_cycles=[1],
+                block_size=(256, 256), block_overlap=(0, 0),
+                detection_method='tophat', snrs={'cy3': 3.0}, n_workers=1,
+                coverage_mask=mask, coverage_downsample=16,
+            )
+            assert len(coords) > 0
+            assert np.all(coords[:, 1] < 128)           # only left-half spots survive
+            assert stats.get('coverage_dropped', 0) > 0
+
+
 if __name__ == '__main__':
     print("Running TestDetectSpotsInBlock...")
     t = TestDetectSpotsInBlock()
