@@ -17,6 +17,8 @@ import numpy as np
 import tifffile
 from pathlib import Path
 
+from sprintseq.readout import mosaic
+
 
 def load_and_merge_spots(position_file, mapping_file, probability_threshold=0.8):
     """
@@ -114,19 +116,35 @@ class _MemmapStack:
         return tile
 
 
-def _open_memmaps(dapi_path, morphology_paths):
-    """Open DAPI + optional morphology files as tifffile memmaps; validate shapes.
+def _as_lazy_source(src):
+    """Accept a path to a stitched TIFF, or an already-opened array-like handle.
 
-    Returns (dapi_memmap, morphology_memmap_list).
+    The contract is widened rather than replaced: several per-run scripts under
+    `SPRINTseq/experiments/` call `prepare_cellsam_input` / `prepare_cellpose_input` with
+    explicit paths and must keep working. `auto_detect_*` returns a path on the legacy
+    backend and an opened handle for a run stored as one OME-Zarr store, where no
+    per-channel file exists to point at.
     """
-    print(f"Memmapping DAPI image: {dapi_path}")
-    dapi = tifffile.memmap(str(dapi_path))
-    morph_paths = [Path(p) for p in (morphology_paths or [])]
+    if isinstance(src, (str, Path)):
+        print(f"Memmapping image: {src}")
+        img = tifffile.memmap(str(src))
+        return img[0] if img.ndim == 3 and img.shape[0] == 1 else img
+    return src
+
+
+def _open_memmaps(dapi_path, morphology_paths):
+    """Open DAPI + optional morphology sources lazily; validate shapes.
+
+    Each source may be a path or an opened handle -- see `_as_lazy_source`. Nothing is
+    read into memory here: stitched SPRINTseq images are routinely 30k x 30k.
+
+    Returns (dapi_source, morphology_source_list).
+    """
+    dapi = _as_lazy_source(dapi_path)
     morphs = []
-    for p in morph_paths:
-        print(f"Memmapping morphology image: {p}")
-        m = tifffile.memmap(str(p))
-        if m.shape != dapi.shape:
+    for p in (morphology_paths or []):
+        m = _as_lazy_source(p)
+        if tuple(m.shape) != tuple(dapi.shape):
             raise ValueError(
                 f"Shape mismatch: morphology {m.shape} vs DAPI {dapi.shape} (source: {p})"
             )
@@ -232,6 +250,59 @@ def _apply_cellsam_patches():
     
     cellSAM.utils.is_low_contrast_clahe = _patched_is_low_contrast_clahe
 
+    # 4b. Monkey Patch cellSAM.utils.enhance_low_contrast to drop dead-letter
+    # `model.bbox_threshold = ...` lines (upstream bug — `model` is not a
+    # parameter of this function and crashes the moment the branch is hit).
+    # bbox_threshold is already controlled via run_cellsam_segmentation's
+    # kwargs one frame up, so dropping these lines is a pure no-op fix.
+    from skimage.exposure import adjust_gamma
+
+    def _patched_enhance_low_contrast(
+        img,
+        lower_contrast_threshold=0.04,
+        upper_contrast_threshold=0.05,
+        max_green_channel_value=0,
+        clip_limit_default=0.03,
+        kernel_size_default=128,
+        gamma_default=0.5,
+        clip_limit_high_diff=0.05,
+        kernel_size_high_diff=64,
+        gamma_high_diff=0.7,
+        bbox_threshold_high_diff=0.3,
+        clip_limit_very_high_diff=0.07,
+        bbox_threshold_very_high_diff=0.2,
+        clip_limit_adjusted=0.01,
+        std_range=(0.005, 0.02),
+        mean_diff_threshold=0.07,
+        mean_std_threshold=0.05,
+    ):
+        low_contrast, mean_diff, mean_std = cellSAM.utils.is_low_contrast_clahe(
+            img,
+            lower_threshold=lower_contrast_threshold,
+            upper_threshold=upper_contrast_threshold,
+        )
+        low_contrast = (
+            (low_contrast and img[..., 1].max() == max_green_channel_value)
+            if mean_diff < mean_std_threshold else low_contrast
+        )
+        if low_contrast:
+            clip_limit = clip_limit_default
+            kernel_size = kernel_size_default
+            gamma = gamma_default
+            if mean_diff > lower_contrast_threshold and mean_std < mean_std_threshold:
+                clip_limit = clip_limit_high_diff
+                kernel_size = kernel_size_high_diff
+                gamma = gamma_high_diff
+            if mean_diff > mean_diff_threshold and mean_std < mean_std_threshold:
+                clip_limit = clip_limit_very_high_diff
+            if mean_diff > mean_diff_threshold and (std_range[0] < mean_std < std_range[1]):
+                clip_limit = clip_limit_adjusted
+            img = equalize_adapthist(img, kernel_size=kernel_size, clip_limit=clip_limit)
+            img = adjust_gamma(img, gamma=gamma)
+        return img
+
+    cellSAM.utils.enhance_low_contrast = _patched_enhance_low_contrast
+
     # 5. Monkey Patch postprocess_predictions with optimized vectorized version
     from scipy.ndimage import gaussian_filter, find_objects
     from skimage.morphology import disk, binary_opening
@@ -275,8 +346,9 @@ def _apply_cellsam_patches():
             if not full_mask.any():
                 continue
             
-            # Find bounding box of this cell
-            objects = find_objects(full_mask)
+            # Find bounding box of this cell. scipy>=1.15 rejects bool input,
+            # so cast the (all_masks == mask_value) mask to a labeled uint8 array.
+            objects = find_objects(full_mask.astype(np.uint8))
             if not objects or objects[0] is None:
                 continue
             
@@ -704,10 +776,23 @@ def assign_spots_to_nuclei_kdtree(spots_df, centroids_df, max_distance=None):
 
 
 def auto_detect_dapi(stitched_dir, preferred_cycles=(11, 1)):
-    """Return the first `cyc_<N>_DAPI.tif` under stitched_dir matching preferred cycle order,
-    or any cyc_*_DAPI.tif if the preferred ones are absent. Raises FileNotFoundError if none found.
+    """Locate the DAPI mosaic, preferring the given cycles.
+
+    Returns a **path** for the legacy per-file layout and an **opened lazy handle** for a
+    run stored as one OME-Zarr store -- both are accepted downstream by
+    `prepare_cellsam_input` / `prepare_cellpose_input`. Raises FileNotFoundError if there
+    is no DAPI mosaic at all.
     """
     stc = Path(stitched_dir)
+    if mosaic.backend(stc) == "zarr":
+        available = [c for c, ch in mosaic.list_mosaics(stc) if ch == "DAPI"]
+        if not available:
+            raise FileNotFoundError(f"No DAPI mosaic in the store under {stc}")
+        for cyc in preferred_cycles:
+            if cyc in available:
+                return mosaic.open_mosaic(stc, cyc, "DAPI")
+        return mosaic.open_mosaic(stc, sorted(available)[0], "DAPI")
+
     for cyc in preferred_cycles:
         p = stc / f"cyc_{cyc}_DAPI.tif"
         if p.exists():
@@ -719,11 +804,21 @@ def auto_detect_dapi(stitched_dir, preferred_cycles=(11, 1)):
 
 
 def auto_detect_morphology(stitched_dir, names=("FAM",)):
-    """Return a list of `cyc_*_<name>.tif` paths for each requested morphology name.
-    Empty list if none found — caller should then switch to nuclei-kdtree mode.
+    """Locate one morphology mosaic per requested channel name.
+
+    Same dual return as `auto_detect_dapi`: paths on the legacy layout, opened handles on
+    a converted run. Empty list if none found -- the caller then switches to
+    nuclei-kdtree mode.
     """
     stc = Path(stitched_dir)
     found = []
+    if mosaic.backend(stc) == "zarr":
+        for name in names:
+            cycles = [c for c, ch in mosaic.list_mosaics(stc) if ch == name]
+            if cycles:
+                found.append(mosaic.open_mosaic(stc, sorted(cycles)[0], name))
+        return found
+
     for name in names:
         matches = sorted(stc.glob(f"cyc_*_{name}.tif"))
         if matches:
