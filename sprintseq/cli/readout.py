@@ -33,6 +33,7 @@ from sprintseq.readout import (
     block_starts,
 )
 from sprintseq.readout.deduplicate import deduplicate_dataframe
+from sprintseq.readout.mosaic import has_mosaic, mosaic_shape, open_mosaic
 
 # Logging
 _LOG_FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -127,7 +128,14 @@ def _default_detection_kwargs(detection_method, channel, snrs=None):
             'threshold': 0.005, 'overlap': 0.5,
         }
     snrs = snrs if snrs is not None else SNRS
-    return {'snr': snrs.get(channel, 3.0), 'tophat_radius': TOPHAT_RADIUS}
+    kwargs = {'snr': snrs.get(channel, 3.0)}
+    # `snr` is popped by get_spot_coordinates and used for the threshold; everything else
+    # is forwarded to the feature extractor, so it must match THAT function's signature.
+    # Only the tophat family takes a radius -- feature_dog / feature_gaussian_dog take
+    # (sigma1, sigma2, normalize_percentile) and used to raise TypeError on this.
+    if 'tophat' in detection_method:
+        kwargs['tophat_radius'] = TOPHAT_RADIUS
+    return kwargs
 
 
 # ========== Worker Functions (module-level for pickling) ==========
@@ -168,9 +176,51 @@ def _read_intensity_in_block(args):
 
 # ========== Stage Functions ==========
 
+def remap_mosaic(cyc, channel):
+    """Logical ``(cycle, channel)`` -> physical ``(cycle, channel)``. Identity by default.
+
+    Override this when a run's logical cycles do not line up with what was acquired --
+    e.g. VIS5c HALF, where logical cyc 2 is physically cyc 3 because a DAPI-activation
+    scan sits in between::
+
+        LOGICAL_TO_PHYSICAL = {1: 1, 2: 3}
+        ro.remap_mosaic = lambda c, ch: (LOGICAL_TO_PHYSICAL.get(c, c), ch)
+
+    This is the single indirection point, and it works for both storage backends. Patching
+    `_get_stitched_image_path` instead only ever affected the legacy per-file layout, and
+    silently does nothing for a run stored as one OME-Zarr store.
+    """
+    return cyc, channel
+
+
 def _get_stitched_image_path(stc_dir, cyc, channel):
-    """Return stitched image path: stc_dir / cyc_{cyc}_{channel}.tif"""
+    """Physical path of a stitched mosaic in the legacy per-file layout.
+
+    Applies `remap_mosaic`. Only meaningful when the run is stored as individual TIFFs --
+    use `_has_stitched` / `_open_stitched` for anything that must also work on a converted
+    run.
+    """
+    cyc, channel = remap_mosaic(cyc, channel)
     return Path(stc_dir) / f'cyc_{cyc}_{channel}.tif'
+
+
+def _has_stitched(stc_dir, cyc, channel):
+    """Backend-agnostic existence check, honouring `remap_mosaic`."""
+    return has_mosaic(stc_dir, *remap_mosaic(cyc, channel))
+
+
+def _open_stitched(stc_dir, cyc, channel):
+    """Open a stitched mosaic for block slicing, honouring `remap_mosaic`.
+
+    Returns something indexable as ``[y0:y1, x0:x1]``; reads stay lazy on both backends,
+    so the block loops behave as they did against ``tifffile.memmap``.
+    """
+    return open_mosaic(stc_dir, *remap_mosaic(cyc, channel))
+
+
+def _stitched_shape(stc_dir, cyc, channel):
+    """Mosaic ``(h, w)`` without reading pixels, honouring `remap_mosaic`."""
+    return mosaic_shape(stc_dir, *remap_mosaic(cyc, channel))
 
 
 def _filter_coords_by_coverage(coords, mask, downsample=16):
@@ -241,26 +291,20 @@ def detect_all_spots(
     n_total_blocks = 0
     for cyc in detection_cycles:
         for channel in channels:
-            img_path = _get_stitched_image_path(stc_dir, cyc, channel)
-            if not img_path.exists():
-                logger.warning(f"Stitched image not found: {img_path}, skipping")
+            if not _has_stitched(stc_dir, cyc, channel):
+                logger.warning(f"Stitched mosaic not found: cyc_{cyc}_{channel}, skipping")
                 continue
-            with tifffile.TiffFile(str(img_path)) as t:
-                sh = t.pages[0].shape
-            h, w = (sh[0], sh[1]) if len(sh) == 2 else (sh[1], sh[2])
+            h, w = _stitched_shape(stc_dir, cyc, channel)
             n_total_blocks += len(block_starts(h, w, block_size, block_overlap))
 
     # Lazy iterator: open memmap per image, yield blocks as numpy arrays
     def _detection_task_iter():
         for cyc in detection_cycles:
             for channel in channels:
-                img_path = _get_stitched_image_path(stc_dir, cyc, channel)
-                if not img_path.exists():
+                if not _has_stitched(stc_dir, cyc, channel):
                     continue
                 detection_kwargs = _default_detection_kwargs(detection_method, channel, snrs)
-                img = tifffile.memmap(str(img_path))
-                if img.ndim == 3:
-                    img = img[0]
+                img = _open_stitched(stc_dir, cyc, channel)
                 h, w = img.shape
                 for start_y, start_x in block_starts(h, w, block_size, block_overlap):
                     end_y = min(start_y + by, h)
@@ -391,7 +435,7 @@ def read_all_intensities(
     # Count total intensity tasks (blocks with spots x existing images)
     n_existing_images = sum(
         1 for cyc in range(1, seq_cycle + 1) for ch in channels
-        if _get_stitched_image_path(stc_dir, cyc, ch).exists()
+        if _has_stitched(stc_dir, cyc, ch)
     )
     n_intensity_total = len(coords_in_block) * n_existing_images
 
@@ -400,13 +444,11 @@ def read_all_intensities(
         for cyc in range(1, seq_cycle + 1):
             for channel in channels:
                 col_name = f'cyc_{cyc}_{channel}'
-                img_path = _get_stitched_image_path(stc_dir, cyc, channel)
-                if not img_path.exists():
-                    logger.warning(f"Stitched image not found: {img_path}, filling with NaN")
+                if not _has_stitched(stc_dir, cyc, channel):
+                    logger.warning(
+                        f"Stitched mosaic not found: cyc_{cyc}_{channel}, filling with NaN")
                     continue
-                img = tifffile.memmap(str(img_path))
-                if img.ndim == 3:
-                    img = img[0]
+                img = _open_stitched(stc_dir, cyc, channel)
                 h, w = img.shape
                 for start_y, start_x in block_starts(h, w, block_size, block_overlap):
                     indices = coords_in_block.get((start_y, start_x), None)
