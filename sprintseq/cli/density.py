@@ -20,6 +20,8 @@ import pandas as pd
 from tifffile import TiffFile, imwrite
 from tqdm import tqdm
 
+from sprintseq.readout.mosaic import has_mosaic, list_mosaics, mosaic_shape
+
 logger = logging.getLogger(__name__)
 
 # ========== Configuration ==========
@@ -27,25 +29,32 @@ BASE_DEST_DIRECTORY = r'\\10.10.10.1\NAS Processed Images'
 DEFAULT_QUALITY = 20
 DEFAULT_THRESHOLD = 0.99  # Q20
 DEFAULT_FAC = 200
-# Reference images to try (in order) for auto-detecting stitched image shape
-REF_IMAGE_CANDIDATES = ['cyc_11_DAPI.tif', 'cyc_11_cy3.tif', 'cyc_1_cy3.tif']
+# Reference mosaics to try (in order) when auto-detecting the stitched canvas shape.
+# (cycle, channel) rather than a filename: a converted run has no per-channel .tif.
+REF_MOSAIC_CANDIDATES = [(11, 'DAPI'), (11, 'cy3'), (1, 'cy3')]
 
 
 def get_stitched_shape(stc_dir):
-    """Auto-detect stitched image shape from reference TIFF.
+    """Auto-detect the stitched canvas shape, on either storage backend.
 
-    Tries REF_IMAGE_CANDIDATES in order, returns (height, width).
+    Tries REF_MOSAIC_CANDIDATES in order, then falls back to whatever mosaic exists --
+    every channel shares the canvas, so any of them answers the question. Returns
+    (height, width) without reading pixels.
     """
-    for ref_name in REF_IMAGE_CANDIDATES:
-        ref_path = os.path.join(stc_dir, ref_name)
-        if os.path.exists(ref_path):
-            with TiffFile(ref_path) as tf:
-                shape = tf.pages[0].shape
-            logger.info(f"Reference image: {ref_name}, shape: {shape}")
+    for cyc, chn in REF_MOSAIC_CANDIDATES:
+        if has_mosaic(stc_dir, cyc, chn):
+            shape = mosaic_shape(stc_dir, cyc, chn)
+            logger.info(f"Reference mosaic: cyc_{cyc}_{chn}, shape: {shape}")
             return shape
+    available = list_mosaics(stc_dir)
+    if available:
+        cyc, chn = available[0]
+        shape = mosaic_shape(stc_dir, cyc, chn)
+        logger.info(f"Reference mosaic (fallback): cyc_{cyc}_{chn}, shape: {shape}")
+        return shape
     raise FileNotFoundError(
-        f"No reference stitched image found in {stc_dir}. "
-        f"Tried: {REF_IMAGE_CANDIDATES}"
+        f"No stitched mosaic found in {stc_dir}. "
+        f"Tried: {REF_MOSAIC_CANDIDATES}"
     )
 
 
