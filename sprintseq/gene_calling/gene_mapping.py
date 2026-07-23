@@ -1333,12 +1333,32 @@ def postcode_mapping(intensity_df, ref_file, cyc_num=10, channels=['cy3', 'cy5']
     # Recalculate normalized data for subset ONLY
     data_norm_subset = (torch.log10(data[ind_keep, :] + log_add) - data_log_mean) / data_log_std
 
-    optim = Adam({'lr': 0.085, 'betas': [0.85, 0.99]})
-    svi = SVI(model_constrained_tensor, auto_guide_constrained_tensor, optim, loss=TraceEnum_ELBO(max_plate_nesting=1))
-    pyro.set_rng_seed(set_seed)
-    
-    losses = train(svi, num_iter, data_norm_subset, len(ind_keep), D, C, R, codes.shape[0], codes, 
-                   print_training_progress, min(len(ind_keep), batch_size))
+    # SVI training with learning-rate backoff. PoSTcode's Adam(lr=0.085) can diverge
+    # to NaN on the very first step for some well-conditioned-but-heavy-tailed datasets
+    # (observed 2026-06-06 on 20260605_BZ23_mut_6: normalized data abs_max ~3.7, no
+    # degenerate column, yet theta -> NaN at iter 1). Healthy datasets converge at the
+    # first (0.085) lr and are unaffected; fragile ones auto-retry at a lower lr.
+    losses = None
+    lr_schedule = [0.085, 0.05, 0.03, 0.015]
+    for attempt, cur_lr in enumerate(lr_schedule):
+        optim = Adam({'lr': cur_lr, 'betas': [0.85, 0.99]})
+        svi = SVI(model_constrained_tensor, auto_guide_constrained_tensor, optim, loss=TraceEnum_ELBO(max_plate_nesting=1))
+        pyro.set_rng_seed(set_seed)
+        try:
+            losses = train(svi, num_iter, data_norm_subset, len(ind_keep), D, C, R, codes.shape[0], codes,
+                           print_training_progress, min(len(ind_keep), batch_size))
+            if not np.isfinite(losses[-1]):
+                raise ValueError("non-finite final ELBO loss")
+            if attempt > 0 and verbose:
+                print(f"  PoSTcode SVI converged after lr backoff to {cur_lr:g}")
+            break
+        except (ValueError, RuntimeError) as e:
+            pyro.clear_param_store()
+            if attempt == len(lr_schedule) - 1:
+                raise
+            if verbose:
+                print(f"  PoSTcode SVI diverged at lr={cur_lr:g} ({type(e).__name__}); "
+                      f"retrying at lr={lr_schedule[attempt + 1]:g}")
                    
     # Clean up training data
     del data_norm_subset
