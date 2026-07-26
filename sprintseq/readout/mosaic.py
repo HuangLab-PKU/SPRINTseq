@@ -74,11 +74,13 @@ def _images(stitch_dir):
     return [(None, *_image_meta(store, None))]
 
 
-#: Hand-made derivatives left in the stitched dir (crops, masks) that are NOT channels.
-#: A channel token never ends in one of these; treating e.g. cyc_11_DAPI_crop as a channel
-#: mis-reads a derived file as real signal.
+#: Hand-made derivatives left in the stitched dir (crops, masks, filtered copies) that are
+#: NOT channels. A channel token never ends in one of these; treating e.g. cyc_11_DAPI_crop
+#: or cyc_1_cy3_tophat as a channel mis-reads a derived file as real signal. Keep in sync
+#: with spatial_img_core.mosaic_io._DERIVED_SUFFIXES.
 _DERIVED_SUFFIXES = ("_crop", "_cut", "_mask", "_masked", "_roi", "_thumb", "_preview",
-                     "_small", "_downsample", "_downsampled", "_test")
+                     "_small", "_downsample", "_downsampled", "_test", "_tophat",
+                     "_filtered", "_bgsub", "_norm")
 
 
 def list_mosaics(stitch_dir):
