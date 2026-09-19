@@ -112,7 +112,7 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
                  label=None, fmt=DEFAULT_FORMAT, fac=None, roi=None, mask=None, spots=None,
                  exclude_fov_masked=False, display_max=None,
                  min_border_area=cm.DEFAULT_MIN_BORDER_AREA,
-                 pixel_size_um=DEFAULT_PIXEL_SIZE_UM, output=None,
+                 pixel_size_um=DEFAULT_PIXEL_SIZE_UM, output=None, geojson=True,
                  base_dir=BASE_DEST_DIRECTORY):
     """Build the per-cell gene maps for one RUN_ID (see module docstring for outputs)."""
     t0 = time.time()
@@ -135,6 +135,12 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
     suffix = '.ome.tif' if fmt == 'ome' else '.zip'
     out_path = seg_dir / (output or f'{tag}_{stem}{roi_tag}{suffix}')
     total_path = seg_dir / f'{tag}_total{roi_tag}.zip' if fmt == 'imagej' else None
+    geo_name = out_path.name
+    for ext in ('.ome.tif', '.zip', '.tif'):
+        if geo_name.lower().endswith(ext):
+            geo_name = geo_name[:-len(ext)]
+            break
+    geojson_path = out_path.with_name(geo_name + '.geojson') if geojson else None
 
     logger.info("=" * 60)
     logger.info("Cell map builder -- RUN_ID: %s", run_id)
@@ -151,6 +157,7 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
         mask_path, spot_df, genes, out_path, fmt=fmt, total_path=total_path,
         fac=fac, px_um=pixel_size_um * fac, roi=roi,
         min_border_area=min_border_area, display_max=display_max,
+        geojson_path=geojson_path,
     )
 
     logger.info("Mask/spot Cell_ID agreement: %.2f%% of %s spots checked",
@@ -173,6 +180,10 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
                     len(genes) + 1, len(stats['level_shapes']),
                     ' > '.join(f'{w}x{h}' for h, w in stats['level_shapes']),
                     stats['raw_bytes'] / 2**30)
+    if geojson_path is not None:
+        logger.info("Written: %s (%.1f MiB; %s cells with 'total' + non-zero gene counts as "
+                    "QuPath measurements -> Measure > Show measurement maps)", geojson_path,
+                    os.path.getsize(geojson_path) / 2**20, f"{stats['geojson_cells']:,}")
     logger.info("Done in %.1fs", time.time() - t0)
     return stats
 
@@ -223,6 +234,10 @@ def add_arguments(p):
     p.add_argument('--output', type=str, default=None,
                    help='Output filename in segmented/ (ome: .ome.tif; imagej: .zip = '
                         'ImageJ-ZIP, .tif = plain). Auto-named if omitted.')
+    p.add_argument('--no-geojson', dest='geojson', action='store_false',
+                   help="Skip the <output>.geojson of cell outlines with 'total' + per-gene "
+                        "counts as QuPath measurements (colour cells by gene via Measure > "
+                        "Show measurement maps).")
 
 
 def run_from_args(args):
@@ -235,7 +250,7 @@ def run_from_args(args):
         threshold=prob, label=label, fmt=args.fmt, fac=args.fac, roi=args.roi,
         mask=args.mask, spots=args.spots, exclude_fov_masked=args.exclude_fov_masked,
         display_max=args.display_max, min_border_area=args.min_border_area,
-        pixel_size_um=args.pixel_size, output=args.output,
+        pixel_size_um=args.pixel_size, output=args.output, geojson=args.geojson,
     )
 
 

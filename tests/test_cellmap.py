@@ -11,6 +11,7 @@ onto the wrong cells.
 """
 import argparse
 import io
+import json
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -262,6 +263,64 @@ class TestImageJOutputs:
         monkeypatch.setattr(cm, "IMAGEJ_MAX_BYTES", 1000)
         with pytest.raises(ValueError, match="4 GiB"):
             _run(run_dir, fmt='imagej')
+
+
+class TestGeoJson:
+    """Cell outlines + counts as QuPath measurements, in full-resolution mosaic pixels."""
+
+    def _features(self, path):
+        feats = json.loads(path.read_text(encoding="utf-8"))["features"]
+        return {f["properties"]["measurements"]["Cell ID"]: f for f in feats}
+
+    def test_every_cell_with_sparse_counts(self, run_dir):
+        stats = _run(run_dir)
+        feats = self._features(run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_genes.geojson")
+        assert sorted(feats) == [1, 2, 3, 4] and stats['geojson_cells'] == 4
+        m = {k: f["properties"]["measurements"] for k, f in feats.items()}
+        assert m[1] == {"Cell ID": 1, "total": 4, "GeneA": 3, "GeneB": 1}
+        assert m[2] == {"Cell ID": 2, "total": 3, "GeneA": 1, "GeneC": 2}
+        assert m[4] == {"Cell ID": 4, "total": 0}        # segmented, no spots: still drawn
+        for f in feats.values():
+            assert f["properties"]["objectType"] == "detection"
+            ring = f["geometry"]["coordinates"][0]
+            assert ring[0] == ring[-1] and len(ring) >= 4
+
+    def test_outlines_sit_on_the_cells_in_full_res_pixels(self, run_dir):
+        _run(run_dir)
+        feats = self._features(run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_genes.geojson")
+        xs, ys = zip(*feats[1]["geometry"]["coordinates"][0])
+        assert 20 <= min(xs) and max(xs) <= 60 and 20 <= min(ys) and max(ys) <= 60   # cell 1
+        xs, ys = zip(*feats[3]["geometry"]["coordinates"][0])                       # restored
+        assert (min(xs), max(xs), min(ys), max(ys)) == (150, 160, 150, 160)
+        xs, _ = zip(*feats[2]["geometry"]["coordinates"][0])
+        assert min(xs) >= 60                           # cell 2 starts where cell 1 ends
+
+    def test_roi_outlines_keep_mosaic_coordinates(self, run_dir):
+        _run(run_dir, fac=2, roi=(10, 70, 10, 110), use_all=True, gene_file=None)
+        feats = self._features(run_dir / f"{RUN}_processed" / "segmented"
+                               / "cellmap_Q20_all_y10-70_x10-110.geojson")
+        assert sorted(feats) == [1, 2]
+        xs, ys = zip(*feats[1]["geometry"]["coordinates"][0])
+        assert 20 <= min(xs) <= 22 and 58 <= max(xs) <= 60 and 20 <= min(ys) and max(ys) <= 60
+
+    def test_one_pixel_necks_do_not_make_invalid_polygons(self):
+        """Two blobs joined by a diagonal / one-pixel neck: the raw centre-line contour
+        self-intersects, which makes QuPath refuse the WHOLE file."""
+        shapely = pytest.importorskip("shapely")
+        m = np.zeros((12, 12), np.uint32)
+        m[1:5, 1:5] = 7
+        m[5, 5] = 7                                     # diagonal chain to the second blob
+        m[6:10, 6:10] = 7
+        m[2, 8:11] = 7
+        m[3, 10] = 7
+        from scipy.ndimage import find_objects
+        (sl,) = [s for s in find_objects(m) if s is not None]
+        ring = cm._outline((m[sl] == 7).astype(np.uint8), sl, 10, (0, 0))
+        assert shapely.Polygon(ring).is_valid and ring[0] == ring[-1]
+
+    def test_can_be_switched_off(self, run_dir):
+        _run(run_dir, geojson=False)
+        assert not list((run_dir / f"{RUN}_processed" / "segmented").glob("*.geojson"))
 
 
 class TestGuards:

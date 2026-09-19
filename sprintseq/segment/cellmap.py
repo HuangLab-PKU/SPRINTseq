@@ -38,6 +38,7 @@ Two output formats:
 uint8 is written whenever every value fits.
 """
 
+import json
 import logging
 import math
 import os
@@ -65,6 +66,7 @@ MATCH_ERROR = 0.5             # below this, mask and spot table are different se
 MATCH_WARN = 0.95
 OME_TILE = 512
 PYRAMID_TOP_MAX = 1024        # add 2x levels until the coarsest fits in this many px
+CELL_CLASS_COLOR = [220, 220, 220]   # QuPath class colour of the GeoJSON cells (grey)
 
 
 @contextmanager
@@ -373,9 +375,109 @@ def write_ome_pyramid(path, label_maps, steps, cell_ids, values, channel_names, 
     return os.path.getsize(path)
 
 
+def _outline(sub, sl, fac, origin):
+    """Largest outer contour of one cell's bbox mask, as a closed full-res ``(x, y)`` ring.
+
+    Vertices come from the label map at ``fac`` (pixel centres, +/- fac/2 full-res px);
+    a cell too thin for a contour (1-2 map px, or a line) gets its pixel-edge bounding box.
+    """
+    import cv2
+
+    y0, x0 = origin
+    oy, ox = sl[0].start, sl[1].start
+    cnts, _ = cv2.findContours(sub, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnt = max(cnts, key=cv2.contourArea)[:, 0, :] if cnts else None
+    if cnt is None or len(cnt) < 3 or cv2.contourArea(cnt) == 0:
+        ys, xs = np.nonzero(sub)
+        c0, c1, r0, r1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
+        pts = [(x0 + (ox + c) * fac, y0 + (oy + r) * fac)
+               for c, r in ((c0, r0), (c1, r0), (c1, r1), (c0, r1))]
+    else:
+        pts = [(x0 + (ox + c + 0.5) * fac, y0 + (oy + r + 0.5) * fac) for c, r in cnt]
+    ring = [[round(float(x), 1), round(float(y), 1)] for x, y in pts]
+    return _valid_ring(ring + [ring[0]])
+
+
+def _valid_ring(ring):
+    """Return a ring QuPath will accept.
+
+    A contour through pixel centres folds back on itself across a one-pixel neck, and a
+    single self-intersecting polygon makes QuPath's GeoJSON import fail outright
+    ("Reduction failed, possible invalid input"; 277 of 181k BZ07 cells). Invalid rings are
+    repaired with shapely (largest part of ``make_valid``), falling back to the convex hull;
+    without shapely installed, every ring is replaced by its hull (valid by construction).
+    """
+    try:
+        import shapely
+    except ImportError:
+        import cv2
+
+        hull = cv2.convexHull(np.asarray(ring[:-1], np.float32))[:, 0, :].tolist()
+        return [[round(x, 1), round(y, 1)] for x, y in hull] + [[round(hull[0][0], 1),
+                                                                 round(hull[0][1], 1)]]
+    poly = shapely.Polygon(ring)
+    if poly.is_valid:
+        return ring
+    fixed = shapely.make_valid(poly)
+    parts = [g for g in shapely.get_parts(fixed) if g.geom_type == "Polygon" and g.area > 0]
+    candidates = ([max(parts, key=lambda g: g.area)] if parts else []) + [poly.convex_hull]
+    for cand in candidates:
+        out = [[round(x, 1), round(y, 1)] for x, y in cand.exterior.coords]
+        if len(out) >= 4 and shapely.Polygon(out).is_valid:
+            return out
+    return ring
+
+
+def write_cells_geojson(path, lab, cell_ids, counts, totals, genes, *, fac, origin,
+                        extra_pixels=()):
+    """Every cell in ``lab`` as a QuPath detection, with its counts as measurements.
+
+    Coordinates are full-resolution mosaic pixels (QuPath's space for the stitched image).
+    Measurements: ``Cell ID``, ``total`` (all genes) and each gene with a NON-ZERO count --
+    QuPath reads an absent measurement as NaN, so in a measurement map a cell without the
+    gene keeps its grey class colour rather than the bottom of the colour scale (the
+    Xenium look), and the file stays small. Cells without any spot are included too
+    (``total`` 0), so every segmented cell shows. ``extra_pixels`` = ``[(label, row, col)]``
+    adds cells present only as a restored single map pixel. Returns the feature count.
+    """
+    from scipy.ndimage import find_objects
+
+    row_of = {int(c): i for i, c in enumerate(cell_ids)}
+
+    def feature(label, ring):
+        i = row_of.get(label)
+        meas = {"Cell ID": label, "total": int(totals[i]) if i is not None else 0}
+        if i is not None:
+            meas.update({genes[k]: int(counts[i, k]) for k in np.flatnonzero(counts[i])})
+        return json.dumps({
+            "type": "Feature",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "properties": {"objectType": "detection",
+                           "classification": {"name": "Cell", "color": CELL_CLASS_COLOR},
+                           "measurements": meas, "isLocked": True},
+        }, separators=(",", ":"))
+
+    n = 0
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"type":"FeatureCollection","features":[')
+        for label, sl in enumerate(find_objects(lab), start=1):
+            if sl is None:
+                continue
+            sub = (lab[sl] == label).astype(np.uint8)
+            fh.write(("," if n else "") + feature(label, _outline(sub, sl, fac, origin)))
+            n += 1
+        for label, r, c in extra_pixels:
+            sl = (slice(int(r), int(r) + 1), slice(int(c), int(c) + 1))
+            fh.write(("," if n else "") + feature(int(label), _outline(
+                np.ones((1, 1), np.uint8), sl, fac, origin)))
+            n += 1
+        fh.write("]}")
+    return n
+
+
 def build_cell_maps(mask_path, spots, genes, output_path, *, fac, px_um, roi=None,
                     fmt='ome', total_path=None, min_border_area=DEFAULT_MIN_BORDER_AREA,
-                    display_max=None, total_display_max=None):
+                    display_max=None, total_display_max=None, geojson_path=None):
     """Build the per-cell gene maps for one mask.
 
     ``fmt='ome'``: one pyramidal OME-TIFF at *output_path*, channels
@@ -422,13 +524,26 @@ def build_cell_maps(mask_path, spots, genes, output_path, *, fac, px_um, roi=Non
         maps.append(lab)
         if step == 1:
             n_restored, n_lost = restored, lost
-    del lab_raw
     base = maps[0]
 
     rows, cols = to_map_index(cy, y0, fac), to_map_index(cx, x0, fac)
     in_view = (rows >= 0) & (rows < base.shape[0]) & (cols >= 0) & (cols < base.shape[1])
-    present = np.bincount(base.ravel(), minlength=int(cell_ids.max(initial=0)) + 1) > 0
+    size = max(int(cell_ids.max(initial=0)), int(base.max()), int(lab_raw.max())) + 1
+    present = np.bincount(base.ravel(), minlength=size) > 0
     shown = present[cell_ids]
+
+    if geojson_path is not None:
+        # Outlines from the UNBORDERED map (the 1-px separation lines would shave a side off
+        # every cell); cells only restored as a centroid pixel are added as that pixel.
+        in_raw = np.bincount(lab_raw.ravel(), minlength=size) > 0
+        only_restored = shown & ~in_raw[cell_ids] & in_view
+        extra = [(int(i), int(r), int(c)) for i, r, c in
+                 zip(cell_ids[only_restored], rows[only_restored], cols[only_restored])
+                 if base[r, c] == i]
+        stats["geojson_cells"] = write_cells_geojson(
+            geojson_path, lab_raw, cell_ids, counts, totals, genes, fac=fac, origin=(y0, x0),
+            extra_pixels=extra)
+    del lab_raw
     stats.update(
         map_shape=base.shape, level_shapes=[m.shape for m in maps],
         n_cells=len(cell_ids), n_cells_in_view=int(in_view.sum()), n_cells_shown=int(shown.sum()),
