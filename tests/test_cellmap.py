@@ -1,0 +1,235 @@
+"""Per-cell gene maps (`sprintseq cell-map`): counts painted onto real cell footprints.
+
+The contract that matters downstream: ImageJ must show the per-cell count as the pixel
+value, name every slice by gene, and keep the LUT / display range / um calibration --
+through the ImageJ-ZIP container, since a compressed TIFF stack loses its slice labels
+in ImageJ. A mask that does not belong to the spot table must fail loudly, not paint
+counts onto the wrong cells.
+"""
+import argparse
+import io
+import zipfile
+
+import numpy as np
+import pandas as pd
+import pytest
+import tifffile
+
+from sprintseq.cli import cellmap as cli
+from sprintseq.segment import cellmap as cm
+
+pytest.importorskip("zarr")
+
+RUN = "20990101_TEST_cellmap"
+FAC = 10
+
+
+def _mask():
+    m = np.zeros((200, 240), dtype=np.uint32)
+    m[20:60, 20:60] = 1      # big cell
+    m[20:60, 60:100] = 2     # touches cell 1 along x = 60
+    m[150:153, 150:153] = 3  # smaller than a 10 x 10 block: no sample point lands on it
+    m[100:140, 150:200] = 4  # a cell without spots
+    return m
+
+
+def _spots():
+    rows = (
+        [(40.2, 40.7, 'GeneA', 1.0, 1)] * 3
+        + [(30.0, 30.0, 'GeneB', 0.995, 1),
+           (31.0, 31.0, 'GeneB', 0.5, 1),          # below Q20
+           (32.0, 32.0, 'Background', 1.0, 1),     # not a gene
+           (33.0, 33.0, 'Infeasible', 1.0, 1),
+           (40.0, 80.0, 'GeneA', 0.999, 2),
+           (41.0, 81.0, 'SP_12_GeneC', 1.0, 2),    # prefix stripped like density
+           (42.0, 82.0, 'SP_12_GeneC', 1.0, 2)]
+        + [(151.5, 151.5, 'GeneB', 1.0, 3)] * 4
+    )
+    df = pd.DataFrame(rows, columns=['Y', 'X', 'Gene', 'Probability', 'Cell_ID'])
+    df['fov_masked'] = False
+    df.loc[df.index[-5], 'fov_masked'] = True     # one of cell 2's GeneC spots
+    return df
+
+
+@pytest.fixture
+def run_dir(tmp_path):
+    seg = tmp_path / f"{RUN}_processed" / "segmented"
+    seg.mkdir(parents=True)
+    tifffile.imwrite(seg / "cellsam_mask.tif", _mask(), tile=(64, 64), compression='zlib')
+    _spots().to_csv(seg / "assigned_spots.csv", index=False)
+    (tmp_path / "genes.txt").write_text("GeneA\nGeneC\nGeneB\nGeneZ\n", encoding="utf-8")
+    return tmp_path
+
+
+def _read_zip(path):
+    with zipfile.ZipFile(path) as zf:
+        (name,) = zf.namelist()
+        assert name == path.stem + ".tif"
+        with tifffile.TiffFile(io.BytesIO(zf.read(name))) as tf:
+            page = tf.pages[0]
+            return (tf.asarray(), tf.imagej_metadata, page.compression,
+                    page.tags['XResolution'].value, page.colormap)
+
+
+def _run(run_dir, **kw):
+    kw.setdefault('gene_file', str(run_dir / "genes.txt"))
+    kw.setdefault('fac', FAC)
+    return cli.run_pipeline(RUN, threshold=0.99, label="Q20", base_dir=str(run_dir), **kw)
+
+
+class TestSpotTable:
+    def test_filter_matches_density_cut(self):
+        out = cm.filter_spots(_spots(), 0.99)
+        assert set(out['Gene']) == {'GeneA', 'GeneB', 'GeneC'}   # prefix stripped, non-genes gone
+        assert (out['Probability'] > 0.99).all()
+        assert len(out) == 3 + 1 + 1 + 2 + 4
+
+    def test_fov_masked_spots_dropped_on_request(self):
+        assert len(cm.filter_spots(_spots(), 0.99, exclude_fov_masked=True)) == 10
+
+    def test_fov_masked_requires_the_column(self):
+        with pytest.raises(ValueError, match="fov_masked"):
+            cm.filter_spots(_spots().drop(columns='fov_masked'), 0.99, exclude_fov_masked=True)
+
+    def test_counts_and_totals(self):
+        spots = cm.filter_spots(_spots(), 0.99)
+        ids, counts, totals, cy, cx = cm.cell_gene_counts(spots, ['GeneA', 'GeneB', 'GeneC', 'GeneZ'])
+        assert ids.tolist() == [1, 2, 3]
+        assert counts.tolist() == [[3, 1, 0, 0], [1, 0, 2, 0], [0, 4, 0, 0]]
+        assert totals.tolist() == [4, 3, 4]
+        assert cy[2] == pytest.approx(151.5) and cx[2] == pytest.approx(151.5)
+
+
+class TestLabelMap:
+    def test_border_separates_touching_cells_only_where_they_touch(self):
+        lab = cm.downsample_labels(_mask(), FAC, (0, 200, 0, 240))
+        sep = cm.separate_touching_cells(lab, min_area=9)
+        assert lab[4, 6] == 2 and sep[4, 6] == 0     # first column of cell 2, next to cell 1
+        assert sep[4, 7] == 2 and sep[4, 5] == 1     # both cells keep their interiors
+        assert (sep[lab == 4] == 4).all()            # a free-standing cell is untouched
+
+    def test_small_cells_keep_every_pixel(self):
+        lab = np.array([[1, 2], [1, 2]], dtype=np.uint32)
+        assert (cm.separate_touching_cells(lab, min_area=9) == lab).all()
+
+    def test_missed_cell_restored_at_centroid(self):
+        lab = cm.downsample_labels(_mask(), FAC, (0, 200, 0, 240))
+        assert 3 not in lab
+        ids = np.array([1, 3])
+        rows = cm.to_map_index([40.0, 151.5], 0, FAC)
+        cols = cm.to_map_index([40.0, 151.5], 0, FAC)
+        restored, lost = cm.restore_missing_cells(lab, ids, rows, cols)
+        assert (restored, lost) == (1, 0)
+        assert lab[15, 15] == 3
+
+    def test_colliding_centroids_keep_one_owner_and_count_the_rest_lost(self):
+        lab = np.zeros((4, 4), dtype=np.uint32)
+        lab[0, 0] = 9                                  # sampled cell holding pixel (0, 0)
+        ids = np.array([5, 6, 7])
+        rows, cols = np.array([2, 2, 0]), np.array([3, 3, 0])   # 5 and 6 share (2, 3); 7 hits cell 9
+        restored, lost = cm.restore_missing_cells(lab, ids, rows, cols)
+        assert (restored, lost) == (1, 2)
+        assert lab[2, 3] == 5 and lab[0, 0] == 9
+
+    def test_trailing_partial_block_is_sampled(self):
+        m = np.zeros((203, 241), dtype=np.uint32)
+        m[201:203, 30:40] = 7                          # lives only in the 3-row strip past row 200
+        m[50:60, 240] = 8                              # lives only in the last column
+        lab = cm.downsample_labels(m, FAC, (0, 203, 0, 241))
+        assert lab.shape == (21, 25)                   # ceil(203/10), ceil(241/10)
+        assert lab[20, 3] == 7 and lab[5, 24] == 8
+        assert (cm.to_map_index([202, 240], 0, FAC) == [20, 24]).all()
+
+    def test_wrong_mask_is_rejected(self, run_dir):
+        spots = _spots()
+        spots['Cell_ID'] = spots['Cell_ID'].map({1: 2, 2: 1, 3: 4})
+        spots.to_csv(run_dir / f"{RUN}_processed" / "segmented" / "assigned_spots.csv", index=False)
+        with pytest.raises(ValueError, match="not the mask"):
+            _run(run_dir)
+
+
+class TestOutputs:
+    def test_stack_is_imagej_zip_with_gene_labels(self, run_dir):
+        stats = _run(run_dir)
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        stack, meta, compression, xres, cmap = _read_zip(seg / "cellmap_Q20_genes.zip")
+        assert stack.shape == (4, 20, 24) and stack.dtype == np.uint8
+        assert compression == 1                        # uncompressed inside: ImageJ keeps labels
+        assert meta['Labels'] == ['GeneA', 'GeneC', 'GeneB', 'GeneZ']
+        assert meta['unit'] == 'um' and meta['min'] == 0
+        assert xres[1] / xres[0] == pytest.approx(0.1625 * FAC)   # um per map pixel
+        assert cmap is not None
+        a, c, b, z = stack
+        assert a[4, 4] == 3 and a[4, 8] == 1          # pixel value = per-cell count
+        assert c[4, 8] == 2 and c[4, 4] == 0
+        assert b[15, 15] == 4                          # the restored small cell
+        assert a[4, 6] == 0                            # border between cells 1 and 2
+        assert not z.any() and not stack[:, 12, 16].any()   # absent gene, cell without spots
+        assert stats['genes_without_spots'] == ['GeneZ']
+        assert stats['match_fraction'] == 1.0
+        assert (stats['n_restored'], stats['n_lost']) == (1, 0)
+
+    def test_total_map(self, run_dir):
+        _run(run_dir)
+        total, meta, *_ = _read_zip(run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_total.zip")
+        assert total.shape == (20, 24)
+        assert (total[4, 4], total[4, 8], total[15, 15], total[12, 16]) == (4, 3, 4, 0)
+        assert meta['Labels'] in ('total', ['total'])   # tifffile unwraps a single label
+
+    def test_fov_masked_run_is_named_and_counted_separately(self, run_dir):
+        _run(run_dir, exclude_fov_masked=True)
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        stack, *_ = _read_zip(seg / "cellmap_Q20_fovmasked_genes.zip")
+        assert stack[1, 4, 8] == 1                    # one GeneC spot of cell 2 was fov-masked
+        assert (seg / "cellmap_Q20_fovmasked_total.zip").is_file()
+
+    def test_roi_close_up(self, run_dir):
+        stats = _run(run_dir, fac=2, roi=(10, 70, 10, 110), use_all=True, gene_file=None)
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        stack, meta, *_ = _read_zip(seg / "cellmap_Q20_all_y10-70_x10-110.zip")
+        assert stats['map_shape'] == (30, 50)
+        assert meta['Labels'] == ['GeneA', 'GeneB', 'GeneC']
+        assert stack[0, 15, 15] == 3                  # full-res (40, 40) -> ROI map (15, 15)
+
+    def test_plain_tif_output(self, run_dir):
+        _run(run_dir, output="custom.tif")
+        with tifffile.TiffFile(run_dir / f"{RUN}_processed" / "segmented" / "custom.tif") as tf:
+            assert tf.imagej_metadata['Labels'][0] == 'GeneA'
+
+    def test_no_spots_passing_threshold_fails(self, run_dir):
+        with pytest.raises(ValueError, match="No spots"):
+            cli.run_pipeline(RUN, gene_file=str(run_dir / "genes.txt"), threshold=1.0,
+                             label="P1", fac=FAC, base_dir=str(run_dir))
+
+    def test_unverifiable_pairing_warns(self, run_dir, caplog):
+        _run(run_dir, roi=(160, 200, 0, 240))         # no spot inside this strip
+        assert "Could not verify" in caplog.text
+
+    def test_over_imagej_limit_fails_before_writing(self, run_dir, monkeypatch):
+        monkeypatch.setattr(cm, "IMAGEJ_MAX_BYTES", 1000)
+        with pytest.raises(ValueError, match="4 GiB"):
+            _run(run_dir)
+
+
+class TestCli:
+    def test_parse_roi(self):
+        assert cli.parse_roi("100:200,300:450") == (100, 200, 300, 450)
+        for bad in ("100:200", "200:100,0:5", "a:b,c:d"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                cli.parse_roi(bad)
+
+    def test_mask_resolution_prefers_cells_over_nuclei(self, run_dir):
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        tifffile.imwrite(seg / "nuclei_mask.tif", _mask())
+        assert cli.resolve_mask(seg).name == "cellsam_mask.tif"
+        assert cli.resolve_mask(seg, "nuclei_mask.tif").name == "nuclei_mask.tif"
+
+    def test_subcommand_registered(self, monkeypatch, run_dir):
+        from sprintseq.cli import main as main_mod
+        seen = {}
+        monkeypatch.setattr(cli, "run_pipeline", lambda run_id, **kw: seen.update(run_id=run_id, **kw))
+        monkeypatch.setattr("sys.argv", ["sprintseq", "cell-map", "--run-id", RUN,
+                                         "--gene-file", str(run_dir / "genes.txt"), "-Q", "30"])
+        main_mod.main()
+        assert seen['run_id'] == RUN and seen['label'] == "Q30" and seen['fac'] == cli.DEFAULT_FAC
+        assert seen['threshold'] == pytest.approx(0.999)

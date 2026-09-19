@@ -8,6 +8,7 @@ Subcommands:
     gene-calling    Intensity correction (optional) + gene mapping.
     density         Per-gene downsampled density TIFFs.
     segment         Cell segmentation + RNA-to-cell assignment.
+    cell-map        Per-cell gene maps: segmented cells painted with their counts.
 
 Run `sprintseq <subcommand> --help` for details on each.
 """
@@ -19,6 +20,7 @@ from pathlib import Path
 # Re-use module-level defaults and run_pipeline helpers from each CLI module.
 # These imports are lazy where possible to keep --help fast and avoid pulling
 # in heavy deps before the user chooses a subcommand.
+from sprintseq.cli import cellmap as cellmap_mod
 from sprintseq.cli import density as density_mod
 from sprintseq.cli import density_stack as ds_mod
 from sprintseq.cli import gene_calling as gc_mod
@@ -378,6 +380,38 @@ def _run_segment(args):
     )
 
 
+def _build_cell_map(sub):
+    p = sub.add_parser(
+        "cell-map",
+        help="Per-cell gene maps: segmented cells painted with their counts.",
+        description=(
+            "Post-processing step after `segment` -- the cell-level counterpart of "
+            "density + density-stack.\n\n"
+            "Downsamples the segmentation mask by --fac, fills every cell's footprint with its "
+            "count for each gene (postcode P > threshold, the same cut as density), and writes "
+            "one stack with a slice per gene plus a total-count map to segmented/. Touching "
+            "cells get a 1-px black border; cells smaller than one block are kept as a pixel at "
+            "their centroid.\n\n"
+            "Output is ImageJ-ZIP (drag into Fiji / ImageJ): slices named by gene, thermal LUT, "
+            "display range and um calibration preset, and ImageJ's pixel value is the per-cell "
+            "count. The TIFF inside is uncompressed so ImageJ keeps the slice labels; the zip "
+            "shrinks the mostly-zero maps ~50-100x."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  # Same gene file as a density stack -> segmented/cellmap_Q20_<stem>.zip + cellmap_Q20_total.zip\n"
+            "  sprintseq cell-map --run-id <id> --gene-file markers.txt\n\n"
+            "  # Every gene, spots in decode-masked tiles dropped\n"
+            "  sprintseq cell-map --run-id <id> --all --exclude-fov-masked\n\n"
+            "  # Close-up of one region at 0.325 um/px\n"
+            "  sprintseq cell-map --run-id <id> --gene-file markers.txt --fac 2 --roi 12000:16000,20000:26000"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cellmap_mod.add_arguments(p)
+    p.set_defaults(_func=cellmap_mod.run_from_args)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="sprintseq",
@@ -394,23 +428,26 @@ def main():
             "  gene-calling    Gene mapping (postcode / threshold / ...).\n"
             "  density         Per-gene density TIFFs.\n"
             "  density-stack   Composite density stack with thermal LUT.\n"
-            "  segment         Cell segmentation + RNA-to-cell assignment.\n\n"
+            "  segment         Cell segmentation + RNA-to-cell assignment.\n"
+            "  cell-map        Per-cell gene maps (cells painted with counts).\n\n"
             "Example end-to-end:\n"
             "  sprintseq readout       --run-id <id>\n"
             "  sprintseq gene-calling  --run-id <id> --ref-file <codebook.csv>\n"
             "  sprintseq density       --run-id <id>\n"
             "  sprintseq density-stack --run-id <id> --gene-file markers.txt\n"
             "  sprintseq segment       --run-id <id> --model <validated-model>\n"
+            "  sprintseq cell-map      --run-id <id> --gene-file markers.txt\n"
         ),
     )
     sub = parser.add_subparsers(dest="command",
-                                metavar="{readout,gene-calling,density,density-stack,segment}")
+                                metavar="{readout,gene-calling,density,density-stack,segment,cell-map}")
 
     _build_readout(sub)
     _build_gene_calling(sub)
     _build_density(sub)
     _build_density_stack(sub)
     _build_segment(sub)
+    _build_cell_map(sub)
 
     args = parser.parse_args()
 

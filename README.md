@@ -25,7 +25,7 @@ If you use SPRINTseq in your work, please cite:
 |---|---|
 | `sprintseq.readout` | Block-based spot detection (Spotiflow / DoG + tophat) and intensity readout from stitched images. |
 | `sprintseq.gene_calling` | Intensity correction (channel balance, decay, phasing) and gene mapping (postcode / threshold / intensity-direct / per-round-max). |
-| `sprintseq.segment` | Cell segmentation (CellSAM / Cellpose with DAPI ± morphology channels) and RNA-to-cell assignment (mask-based or nucleus-centroid KD-tree). |
+| `sprintseq.segment` | Cell segmentation (CellSAM / Cellpose with DAPI ± morphology channels), RNA-to-cell assignment (mask-based or nucleus-centroid KD-tree), and per-cell gene maps (`cellmap`). |
 | `sprintseq.barcode_design` | Barcode graph design utilities (offline codebook generation). |
 
 ## Install
@@ -51,15 +51,19 @@ Inside the HuangLab `spatial-prep-dp` env all four backends are usually already 
 
 ## CLI
 
-After install a single `sprintseq` command is on `PATH`, dispatching four subcommands:
+After install a single `sprintseq` command is on `PATH`, dispatching these subcommands:
 
 ```powershell
 sprintseq --help                                                              # subcommand list
 sprintseq readout       --run-id <RUN_ID> [--detection-cycles 1-4,11] [--seq-cycles 10] [--channels cy3,cy5] [--n-workers 4]
 sprintseq gene-calling  --run-id <RUN_ID> --ref-file <codebook.csv> [--seq-cycles 10] [--channels cy3,cy5]
 sprintseq density       --run-id <RUN_ID> [--threshold 0.95] [--fac 200]
+sprintseq density-stack --run-id <RUN_ID> {--gene-file <genes.txt> | --all} [-Q 20] [--sigma 0.7]
 sprintseq segment       --run-id <RUN_ID> [--dapi <path>] [--morphology <file>]... [--model <name>] [--method {auto,cellsam,cellpose,nuclei-kdtree}]
+sprintseq cell-map      --run-id <RUN_ID> {--gene-file <genes.txt> | --all} [-Q 20] [--fac 10] [--roi y0:y1,x0:x1] [--exclude-fov-masked]
 ```
+
+`cell-map` is the cell-level counterpart of `density-stack`: after `segment`, every cell's mask footprint is filled with its count for each gene (P > threshold, the same cut as density), one slice per gene, plus a total-count map showing every cell. Outputs land in `segmented/` as `cellmap_<Q>_<gene-file stem>.zip` and `cellmap_<Q>_total.zip` — ImageJ-ZIP, so drag them into Fiji/ImageJ: slices are named by gene, the thermal LUT, display range and µm calibration are preset, and the pixel value is the per-cell count. The TIFF inside stays uncompressed because ImageJ drops slice labels from compressed multi-page TIFFs; the zip shrinks the mostly-zero maps ~100× (a 110-gene panel at the default 1.625 µm/px: 17 MB on disk, 2.1 GB in ImageJ). Touching cells get a 1-px black border; cells smaller than one map pixel are kept as a pixel at their centroid. For a close-up, pair a small `--fac` with `--roi` (full-resolution mosaic pixels).
 
 Channel semantics: `--channels cy3,cy5` are the **SBS spot channels** — used for both detection and intensity readout. `--detection-cycles` accepts an explicit list (e.g. `11` for a total-spot staining cycle, `1-4,11` to union classic + total-spot). The `--dapi` / `--morphology` flags on `segment` are separate — morphology is any cell-body marker (FAM, CellMask, WGA, etc.), not required to be FAM. Large-image reads go through `tifffile.memmap` throughout (detection, intensity readout, segmentation prep), so only the active tile is paged into RAM even for 30k × 30k stitched images.
 
