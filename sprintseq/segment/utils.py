@@ -784,7 +784,7 @@ def auto_detect_dapi(stitched_dir, preferred_cycles=(11, 1)):
     is no DAPI mosaic at all.
     """
     stc = Path(stitched_dir)
-    if mosaic.backend(stc) == "zarr":
+    if mosaic.backend(stc) != "tif":          # a store, or its finalized OME-TIFF
         available = [c for c, ch in mosaic.list_mosaics(stc) if ch == "DAPI"]
         if not available:
             raise FileNotFoundError(f"No DAPI mosaic in the store under {stc}")
@@ -812,7 +812,7 @@ def auto_detect_morphology(stitched_dir, names=("FAM",)):
     """
     stc = Path(stitched_dir)
     found = []
-    if mosaic.backend(stc) == "zarr":
+    if mosaic.backend(stc) != "tif":          # a store, or its finalized OME-TIFF
         for name in names:
             cycles = [c for c, ch in mosaic.list_mosaics(stc) if ch == name]
             if cycles:
