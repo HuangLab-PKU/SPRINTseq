@@ -19,17 +19,27 @@ Steps:
 4. Per-cell counts (postcode ``P > threshold``, the same cut as density) are
    painted through a label -> count lookup table, one slice per gene.
 
-Output format: an uncompressed ImageJ TIFF inside a ``.zip`` -- ImageJ's own
-"Save As > ZIP" format, opened natively by File > Open or drag-and-drop. The
-TIFF itself must stay uncompressed: ImageJ opens a compressed multi-page TIFF
-through ``ij.io.Opener.openTiffStack``, which adds every slice with a null
-label, and a stack whose slices are not named by gene is not usable. Zipping
-keeps the labels (the entry is read by the contiguous-stack path) and shrinks
-the mostly-zero maps ~50-100x. uint8 is written whenever every value fits,
-which halves ImageJ's memory use.
+Two output formats:
+
+- **Pyramidal OME-TIFF** (``write_ome_pyramid``, the default): tiled, deflate-
+  compressed BigTIFF, one channel per gene plus a ``total`` channel, with
+  sub-resolution levels in SubIFDs. QuPath and Fiji's Bio-Formats importer read
+  only the tiles and level on screen, so memory does not scale with the file.
+  Every level is painted from its own label map (steps 2-3 redone at that
+  resolution) rather than resampled from the level above, so counts stay
+  integers and every cell stays whole at every zoom.
+- **ImageJ-ZIP** (``write_cell_map``): an uncompressed ImageJ TIFF inside a
+  ``.zip`` -- ImageJ's own "Save As > ZIP" format, opened natively with the
+  thermal LUT and display range preset, but loaded whole into memory. The TIFF
+  must stay uncompressed: ImageJ opens a compressed multi-page TIFF through
+  ``ij.io.Opener.openTiffStack``, which adds every slice with a null label.
+  Zipping keeps the labels and shrinks the mostly-zero maps ~50-100x.
+
+uint8 is written whenever every value fits.
 """
 
 import logging
+import math
 import os
 import tempfile
 import zipfile
@@ -53,6 +63,8 @@ DEFAULT_MIN_BORDER_AREA = 9   # map pixels; smaller cells keep every pixel
 CHECK_BAND_ROWS = 1024        # one tile row of a cellSAM mask
 MATCH_ERROR = 0.5             # below this, mask and spot table are different segmentations
 MATCH_WARN = 0.95
+OME_TILE = 512
+PYRAMID_TOP_MAX = 1024        # add 2x levels until the coarsest fits in this many px
 
 
 @contextmanager
@@ -289,14 +301,95 @@ def _write_imagej_tiff(path, lab, cell_ids, values, slice_labels, *, px_um,
     return nbytes
 
 
-def build_cell_maps(mask_path, spots, genes, stack_path, total_path, *,
-                    fac, px_um, roi=None, min_border_area=DEFAULT_MIN_BORDER_AREA,
+def pyramid_steps(shape, top_max=None):
+    """Downsample steps 1, 2, 4, ... until the coarsest level fits in *top_max* px."""
+    top_max = top_max or PYRAMID_TOP_MAX
+    steps = [1]
+    while max(math.ceil(n / steps[-1]) for n in shape) > top_max:
+        steps.append(steps[-1] * 2)
+    return steps
+
+
+def render_label_map(lab_raw, step, *, fac, origin, cell_ids, cy, cx,
+                     min_border_area=DEFAULT_MIN_BORDER_AREA):
+    """The label map of one pyramid level, drawn from the unbordered base map.
+
+    Resamples *lab_raw* (base map at ``fac``) by *step*, then adds borders and
+    restores missed cells at that level's own resolution. *lab_raw* is not
+    modified. Returns ``(lab, n_restored, n_lost)``.
+    """
+    h, w = lab_raw.shape
+    lab = lab_raw if step == 1 else downsample_labels(lab_raw, step, (0, h, 0, w))
+    lab = separate_touching_cells(lab, min_area=min_border_area) if min_border_area > 0 else lab.copy()
+    y0, x0 = origin
+    restored, lost = restore_missing_cells(lab, cell_ids, to_map_index(cy, y0, fac * step),
+                                           to_map_index(cx, x0, fac * step))
+    return lab, restored, lost
+
+
+def write_ome_pyramid(path, label_maps, steps, cell_ids, values, channel_names, *,
+                      px_um, tile=None, dtype=None):
+    """Paint ``values[:, k]`` onto every level and write a pyramidal OME-TIFF.
+
+    ``label_maps[i]`` is the map at downsample ``steps[i]`` (``steps[0] == 1``,
+    full resolution = *px_um*). Levels 1.. go into SubIFDs of each base plane,
+    the layout Bio-Formats and QuPath read as one multi-resolution image. Tiles
+    are painted one channel at a time and encoded as they are yielded, so only
+    one painted plane is in memory. Returns the file size in bytes.
+    """
+    tile = tile or OME_TILE
+    values = np.asarray(values)
+    n = values.shape[1]
+    dtype = np.dtype(dtype or smallest_dtype(values))
+    top = np.iinfo(dtype).max
+    size = max(max(int(m.max()) for m in label_maps), int(cell_ids.max(initial=0))) + 1
+    lut = np.zeros(size, dtype=dtype)
+
+    def tiles(lab):
+        h, w = lab.shape
+        for k in range(n):
+            lut[:] = 0
+            lut[cell_ids] = np.minimum(values[:, k], top)
+            plane = lut[lab]
+            for y in range(0, h, tile):
+                for x in range(0, w, tile):
+                    yield plane[y:y + tile, x:x + tile]
+
+    options = dict(dtype=dtype, tile=(tile, tile), compression='zlib',
+                   photometric='minisblack', resolutionunit='CENTIMETER')
+    metadata = {
+        'axes': 'CYX',
+        'Channel': {'Name': list(channel_names)},
+        'PhysicalSizeX': px_um, 'PhysicalSizeXUnit': 'µm',
+        'PhysicalSizeY': px_um, 'PhysicalSizeYUnit': 'µm',
+    }
+    with tifffile.TiffWriter(path, bigtiff=True, ome=True) as tif:
+        for i, (step, lab) in enumerate(zip(steps, label_maps)):
+            res = 1e4 / (px_um * step)   # pixels per cm
+            level = (dict(subifds=len(steps) - 1, metadata=metadata) if i == 0
+                     else dict(subfiletype=1))
+            tif.write(tiles(lab), shape=(n, *lab.shape), resolution=(res, res),
+                      **level, **options)
+    return os.path.getsize(path)
+
+
+def build_cell_maps(mask_path, spots, genes, output_path, *, fac, px_um, roi=None,
+                    fmt='ome', total_path=None, min_border_area=DEFAULT_MIN_BORDER_AREA,
                     display_max=None, total_display_max=None):
-    """Build the per-gene cell-map stack and the total-count map for one mask.
+    """Build the per-cell gene maps for one mask.
+
+    ``fmt='ome'``: one pyramidal OME-TIFF at *output_path*, channels
+    ``['total', *genes]``. ``fmt='imagej'``: the gene stack at *output_path* and
+    the total-count map at *total_path*, each with an ImageJ display range
+    (*display_max* / *total_display_max*, else the 99th percentile).
 
     *spots* must already be filtered (``filter_spots``). Returns a dict of
     summary statistics for logging and tests.
     """
+    if fmt not in ('ome', 'imagej'):
+        raise ValueError(f"Unknown format {fmt!r}; choose 'ome' or 'imagej'.")
+    if fmt == 'imagej' and total_path is None:
+        raise ValueError("The imagej format writes the total map separately: pass total_path.")
     if spots.empty:
         raise ValueError("No spots left after filtering -- check the threshold and the spot table.")
     stats = {}
@@ -316,32 +409,50 @@ def build_cell_maps(mask_path, spots, genes, stack_path, total_path, *,
         if n_checked and agreement < MATCH_WARN:
             logger.warning("Mask/spot Cell_ID agreement is %.1f%% (%d spots checked); expected ~100%% "
                            "for mask-based assignment.", 100 * agreement, n_checked)
-        lab = downsample_labels(labels, fac, roi)
+        lab_raw = downsample_labels(labels, fac, roi)
 
     y0, _, x0, _ = roi
-    if min_border_area > 0:
-        lab = separate_touching_cells(lab, min_area=min_border_area)
     cell_ids, counts, totals, cy, cx = cell_gene_counts(spots, genes)
+    steps = pyramid_steps(lab_raw.shape) if fmt == 'ome' else [1]
+    maps, n_restored, n_lost = [], 0, 0
+    for step in steps:
+        lab, restored, lost = render_label_map(
+            lab_raw, step, fac=fac, origin=(y0, x0), cell_ids=cell_ids, cy=cy, cx=cx,
+            min_border_area=min_border_area)
+        maps.append(lab)
+        if step == 1:
+            n_restored, n_lost = restored, lost
+    del lab_raw
+    base = maps[0]
+
     rows, cols = to_map_index(cy, y0, fac), to_map_index(cx, x0, fac)
-    in_view = (rows >= 0) & (rows < lab.shape[0]) & (cols >= 0) & (cols < lab.shape[1])
-    n_restored, n_lost = restore_missing_cells(lab, cell_ids, rows, cols)
-
-    present = np.bincount(lab.ravel(), minlength=int(cell_ids.max(initial=0)) + 1) > 0
+    in_view = (rows >= 0) & (rows < base.shape[0]) & (cols >= 0) & (cols < base.shape[1])
+    present = np.bincount(base.ravel(), minlength=int(cell_ids.max(initial=0)) + 1) > 0
     shown = present[cell_ids]
-    gene_max = display_max if display_max is not None else auto_display_max(counts[shown])
-    total_max = (total_display_max if total_display_max is not None
-                 else auto_display_max(totals[shown]))
-
-    stack_bytes = write_cell_map(stack_path, lab, cell_ids, counts, genes,
-                                 px_um=px_um, display_range=(0, gene_max))
-    total_bytes = write_cell_map(total_path, lab, cell_ids, totals[:, None], ['total'],
-                                 px_um=px_um, display_range=(0, total_max))
     stats.update(
-        map_shape=lab.shape, n_cells=len(cell_ids), n_cells_in_view=int(in_view.sum()),
-        n_cells_shown=int(shown.sum()),
+        map_shape=base.shape, level_shapes=[m.shape for m in maps],
+        n_cells=len(cell_ids), n_cells_in_view=int(in_view.sum()), n_cells_shown=int(shown.sum()),
         n_restored=n_restored, n_lost=n_lost,
         genes_without_spots=[g for g, c in zip(genes, counts.sum(axis=0)) if c == 0],
-        display_max=gene_max, total_display_max=total_max,
-        stack_bytes=stack_bytes, total_bytes=total_bytes,
     )
+
+    if fmt == 'imagej':
+        gene_max = display_max if display_max is not None else auto_display_max(counts[shown])
+        total_max = (total_display_max if total_display_max is not None
+                     else auto_display_max(totals[shown]))
+        stats.update(
+            display_max=gene_max, total_display_max=total_max,
+            stack_bytes=write_cell_map(output_path, base, cell_ids, counts, genes,
+                                       px_um=px_um, display_range=(0, gene_max)),
+            total_bytes=write_cell_map(total_path, base, cell_ids, totals[:, None], ['total'],
+                                       px_um=px_um, display_range=(0, total_max)),
+        )
+    else:
+        values = np.column_stack([totals, counts])
+        itemsize = np.dtype(smallest_dtype(values)).itemsize
+        stats.update(
+            raw_bytes=sum(m.size for m in maps) * values.shape[1] * itemsize,
+            file_bytes=write_ome_pyramid(output_path, maps, steps, cell_ids, values,
+                                         ['total', *genes], px_um=px_um),
+        )
     return stats

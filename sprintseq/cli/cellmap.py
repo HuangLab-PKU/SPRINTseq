@@ -2,21 +2,24 @@
 
 The cell-level counterpart of `sprintseq density` + `sprintseq density-stack`.
 Every cell's mask footprint is filled with that cell's count for a gene, one
-slice per gene, so the map shows real cell positions and shapes and ImageJ's
-pixel readout is the per-cell count. See `sprintseq.segment.cellmap`.
+channel per gene, so the map shows real cell positions and shapes and the
+viewer's pixel readout is the per-cell count. See `sprintseq.segment.cellmap`.
 
 Usage:
     sprintseq cell-map --run-id <run_id> --gene-file genes.txt
     sprintseq cell-map --run-id <run_id> --all --exclude-fov-masked
-    sprintseq cell-map --run-id <run_id> --gene-file genes.txt --fac 2 --roi 12000:16000,20000:26000
+    sprintseq cell-map --run-id <run_id> --gene-file genes.txt --format imagej
 
 Inputs (under `<RUN_ID>_processed/segmented/`, from `sprintseq segment`):
   - the label mask: cellsam_mask.tif, else cellpose_mask.tif, else nuclei_mask.tif
   - assigned_spots.csv (Y, X, Gene, Probability, Cell_ID[, fov_masked])
 
-Outputs (same directory), ImageJ-ZIP -- drag into Fiji / ImageJ:
-  - cellmap_<label>_<gene-file stem | all>.zip   per-gene stack, slices labelled by gene
-  - cellmap_<label>_total.zip                   total transcripts per cell (every cell's position)
+Outputs (same directory):
+  --format ome (default): cellmap_<label>_<gene-file stem | all>.ome.tif
+      pyramidal OME-TIFF, channels [total, genes...]; QuPath / Fiji (Bio-Formats) load
+      only the tiles and resolution level on screen.
+  --format imagej: cellmap_<label>_<stem>.zip + cellmap_<label>_total.zip
+      ImageJ-ZIP, opens in plain ImageJ with thermal LUT + display range, loaded whole.
 """
 
 import argparse
@@ -36,7 +39,11 @@ logger = logging.getLogger(__name__)
 BASE_DEST_DIRECTORY = r'\\10.10.10.1\NAS Processed Images'
 DEFAULT_QUALITY = 20
 DEFAULT_THRESHOLD = 0.99  # Q20, as density
-DEFAULT_FAC = 10          # 1.625 um/px: a median cell is ~4 x 4 px, a full panel stays < 4 GiB
+DEFAULT_FORMAT = 'ome'
+# Full-resolution map pixel per format. OME: 0.65 um/px, a median cell ~11 x 11 px, cheap
+# because viewers read tiles on demand. ImageJ: 1.625 um/px (~4 x 4 px) so a full panel
+# stays under the 4 GiB an ImageJ TIFF can hold and fits in memory.
+DEFAULT_FAC = {'ome': 4, 'imagej': 10}
 DEFAULT_PIXEL_SIZE_UM = 0.1625
 DEFAULT_SPOTS = 'assigned_spots.csv'
 MASK_CANDIDATES = ('cellsam_mask.tif', 'cellpose_mask.tif', 'nuclei_mask.tif')
@@ -102,14 +109,15 @@ def load_spots(spots_path, threshold, exclude_fov_masked):
 
 
 def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THRESHOLD,
-                 label=None, fac=DEFAULT_FAC, roi=None, mask=None, spots=None,
+                 label=None, fmt=DEFAULT_FORMAT, fac=None, roi=None, mask=None, spots=None,
                  exclude_fov_masked=False, display_max=None,
                  min_border_area=cm.DEFAULT_MIN_BORDER_AREA,
                  pixel_size_um=DEFAULT_PIXEL_SIZE_UM, output=None,
                  base_dir=BASE_DEST_DIRECTORY):
-    """Build the per-gene cell-map stack + total-count map for one RUN_ID."""
+    """Build the per-cell gene maps for one RUN_ID (see module docstring for outputs)."""
     t0 = time.time()
     label = label or str(threshold)
+    fac = fac or DEFAULT_FAC[fmt]
     seg_dir = Path(base_dir) / f'{run_id}_processed' / 'segmented'
     if not seg_dir.is_dir():
         raise FileNotFoundError(f"Segmentation directory not found: {seg_dir}. "
@@ -124,14 +132,15 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
     tag = f'cellmap_{label}' + ('_fovmasked' if exclude_fov_masked else '')
     roi_tag = f'_y{roi[0]}-{roi[1]}_x{roi[2]}-{roi[3]}' if roi else ''
     stem = 'all' if use_all else Path(gene_file).stem
-    stack_path = seg_dir / (output or f'{tag}_{stem}{roi_tag}.zip')
-    total_path = seg_dir / f'{tag}_total{roi_tag}.zip'
+    suffix = '.ome.tif' if fmt == 'ome' else '.zip'
+    out_path = seg_dir / (output or f'{tag}_{stem}{roi_tag}{suffix}')
+    total_path = seg_dir / f'{tag}_total{roi_tag}.zip' if fmt == 'imagej' else None
 
     logger.info("=" * 60)
     logger.info("Cell map builder -- RUN_ID: %s", run_id)
     logger.info("=" * 60)
     logger.info("Mask: %s", mask_path)
-    logger.info("Resolution: fac=%d -> %.4g um/px%s", fac, pixel_size_um * fac,
+    logger.info("Format: %s; full resolution fac=%d -> %.4g um/px%s", fmt, fac, pixel_size_um * fac,
                 f", ROI y {roi[0]}:{roi[1]} x {roi[2]}:{roi[3]}" if roi else "")
 
     spot_df = load_spots(spots_path, threshold, exclude_fov_masked)
@@ -139,7 +148,7 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
     logger.info("Genes: %d from %s", len(genes), 'the spot table' if use_all else gene_file)
 
     stats = cm.build_cell_maps(
-        mask_path, spot_df, genes, stack_path, total_path,
+        mask_path, spot_df, genes, out_path, fmt=fmt, total_path=total_path,
         fac=fac, px_um=pixel_size_um * fac, roi=roi,
         min_border_area=min_border_area, display_max=display_max,
     )
@@ -153,10 +162,17 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
     if stats['genes_without_spots']:
         logger.warning("%d gene(s) have no spots and are all-zero slices: %s",
                        len(stats['genes_without_spots']), ', '.join(stats['genes_without_spots']))
-    for path, raw, rng in ((stack_path, stats['stack_bytes'], stats['display_max']),
-                           (total_path, stats['total_bytes'], stats['total_display_max'])):
-        logger.info("Written: %s (%.1f MiB; %.0f MiB in ImageJ; display 0-%g)",
-                    path, os.path.getsize(path) / 2**20, raw / 2**20, rng)
+    if fmt == 'imagej':
+        for path, raw, rng in ((out_path, stats['stack_bytes'], stats['display_max']),
+                               (total_path, stats['total_bytes'], stats['total_display_max'])):
+            logger.info("Written: %s (%.1f MiB; %.0f MiB in ImageJ; display 0-%g)",
+                        path, os.path.getsize(path) / 2**20, raw / 2**20, rng)
+    else:
+        logger.info("Written: %s (%.1f MiB; %d channels [total + genes], %d levels %s; "
+                    "%.1f GiB if uncompressed)", out_path, stats['file_bytes'] / 2**20,
+                    len(genes) + 1, len(stats['level_shapes']),
+                    ' > '.join(f'{w}x{h}' for h, w in stats['level_shapes']),
+                    stats['raw_bytes'] / 2**30)
     logger.info("Done in %.1fs", time.time() - t0)
     return stats
 
@@ -174,10 +190,15 @@ def add_arguments(p):
                    help='Minimum postcode Probability for a spot to count. Overrides -Q when set.')
     p.add_argument('-Q', '--quality', type=int, default=None,
                    help=f'Phred quality score (Q20=0.99, Q30=0.999). (default: Q{DEFAULT_QUALITY})')
-    p.add_argument('--fac', type=int, default=DEFAULT_FAC,
-                   help=f'Downsample factor from the stitched mosaic; one map pixel = fac x fac '
-                        f'mosaic pixels. (default: {DEFAULT_FAC} = '
-                        f'{DEFAULT_FAC * DEFAULT_PIXEL_SIZE_UM:.4g} um/px)')
+    p.add_argument('--format', dest='fmt', choices=['ome', 'imagej'], default=DEFAULT_FORMAT,
+                   help="'ome': pyramidal OME-TIFF for QuPath / Fiji Bio-Formats, read tile by "
+                        "tile. 'imagej': ImageJ-ZIP for plain ImageJ, thermal LUT preset, "
+                        f"loaded whole. (default: {DEFAULT_FORMAT})")
+    p.add_argument('--fac', type=int, default=None,
+                   help='Downsample factor from the stitched mosaic for the full-resolution '
+                        'map; one map pixel = fac x fac mosaic pixels. (default: '
+                        + ', '.join(f'{k} {v} = {v * DEFAULT_PIXEL_SIZE_UM:.4g} um/px'
+                                    for k, v in DEFAULT_FAC.items()) + ')')
     p.add_argument('--roi', type=parse_roi, default=None,
                    help="Restrict to 'y0:y1,x0:x1' in full-resolution mosaic pixels; "
                         "pair with a small --fac for a close-up.")
@@ -190,18 +211,18 @@ def add_arguments(p):
     p.add_argument('--exclude-fov-masked', action='store_true',
                    help="Drop spots flagged 'fov_masked' (as cell_gene_matrix_fovmasked.csv).")
     p.add_argument('--display-max', type=float, default=None,
-                   help='ImageJ display maximum for the gene stack. '
+                   help='(imagej format) Display maximum for the gene stack. '
                         '(default: 99th percentile of non-zero per-cell counts)')
     p.add_argument('--min-border-area', type=int, default=cm.DEFAULT_MIN_BORDER_AREA,
                    help=f'Cells of at least this many map pixels get a 1-px border where they '
                         f'touch a neighbour; 0 disables borders. '
                         f'(default: {cm.DEFAULT_MIN_BORDER_AREA})')
     p.add_argument('--pixel-size', type=float, default=DEFAULT_PIXEL_SIZE_UM,
-                   help=f'Mosaic pixel size in um, for the ImageJ calibration. '
+                   help=f'Mosaic pixel size in um, for the image calibration. '
                         f'(default: {DEFAULT_PIXEL_SIZE_UM})')
     p.add_argument('--output', type=str, default=None,
-                   help='Stack filename in segmented/ (.zip = ImageJ-ZIP, .tif = plain). '
-                        'Auto-named if omitted.')
+                   help='Output filename in segmented/ (ome: .ome.tif; imagej: .zip = '
+                        'ImageJ-ZIP, .tif = plain). Auto-named if omitted.')
 
 
 def run_from_args(args):
@@ -211,7 +232,7 @@ def run_from_args(args):
     prob, label = resolve_threshold_and_label(args.threshold or DEFAULT_THRESHOLD, quality)
     return run_pipeline(
         args.run_id, gene_file=args.gene_file, use_all=args.use_all,
-        threshold=prob, label=label, fac=args.fac, roi=args.roi,
+        threshold=prob, label=label, fmt=args.fmt, fac=args.fac, roi=args.roi,
         mask=args.mask, spots=args.spots, exclude_fov_masked=args.exclude_fov_masked,
         display_max=args.display_max, min_border_area=args.min_border_area,
         pixel_size_um=args.pixel_size, output=args.output,

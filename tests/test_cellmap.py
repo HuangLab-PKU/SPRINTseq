@@ -1,13 +1,17 @@
 """Per-cell gene maps (`sprintseq cell-map`): counts painted onto real cell footprints.
 
-The contract that matters downstream: ImageJ must show the per-cell count as the pixel
-value, name every slice by gene, and keep the LUT / display range / um calibration --
-through the ImageJ-ZIP container, since a compressed TIFF stack loses its slice labels
-in ImageJ. A mask that does not belong to the spot table must fail loudly, not paint
-counts onto the wrong cells.
+The contract that matters downstream: the viewer's pixel value is the per-cell count and
+every channel / slice is named by gene. For the pyramidal OME-TIFF (read tile by tile by
+QuPath and Bio-Formats) that means OME channel names, a physical pixel size, and levels
+that are each painted from the mask -- integer counts, every cell whole -- rather than
+averaged. For ImageJ-ZIP it means slice labels, LUT, display range and um calibration
+surviving the zip container, since a compressed TIFF stack loses its slice labels in
+ImageJ. A mask that does not belong to the spot table must fail loudly, not paint counts
+onto the wrong cells.
 """
 import argparse
 import io
+import xml.etree.ElementTree as ET
 import zipfile
 
 import numpy as np
@@ -69,6 +73,20 @@ def _read_zip(path):
             page = tf.pages[0]
             return (tf.asarray(), tf.imagej_metadata, page.compression,
                     page.tags['XResolution'].value, page.colormap)
+
+
+def _read_ome(path):
+    """Every pyramid level as an array, plus the OME channel names and pixel size."""
+    with tifffile.TiffFile(path) as tf:
+        assert tf.is_ome and tf.is_bigtiff
+        series = tf.series[0]
+        assert series.axes == 'CYX'
+        levels = [lv.asarray() for lv in series.levels]
+        ome = ET.fromstring(tf.ome_metadata)
+        ns = {'o': ome.tag.split('}')[0].strip('{')}
+        pixels = ome.find('.//o:Pixels', ns)
+        names = [c.get('Name') for c in pixels.findall('o:Channel', ns)]
+        return levels, names, float(pixels.get('PhysicalSizeX')), series.levels[0].keyframe
 
 
 def _run(run_dir, **kw):
@@ -148,9 +166,61 @@ class TestLabelMap:
             _run(run_dir)
 
 
-class TestOutputs:
-    def test_stack_is_imagej_zip_with_gene_labels(self, run_dir):
+class TestOmePyramid:
+    @pytest.fixture
+    def small_levels(self, monkeypatch):
+        """Force a 3-level pyramid and 16-px tiles (with ragged edge tiles) on the 20 x 24 map."""
+        monkeypatch.setattr(cm, "PYRAMID_TOP_MAX", 8)
+        monkeypatch.setattr(cm, "OME_TILE", 16)
+
+    def test_default_output_is_named_channel_pyramid(self, run_dir, small_levels):
         stats = _run(run_dir)
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        levels, names, px, page = _read_ome(seg / "cellmap_Q20_genes.ome.tif")
+        assert names == ['total', 'GeneA', 'GeneC', 'GeneB', 'GeneZ']
+        assert px == pytest.approx(0.1625 * FAC)
+        assert [lv.shape for lv in levels] == [(5, 20, 24), (5, 10, 12), (5, 5, 6)]
+        assert stats['level_shapes'] == [(20, 24), (10, 12), (5, 6)]
+        assert page.is_tiled and page.tilewidth == 16 and page.compression == 8   # deflate
+        assert levels[0].dtype == np.uint8
+        assert not (seg / "cellmap_Q20_total.zip").exists()   # total is channel 0 here
+
+    def test_full_resolution_level_matches_the_imagej_maps(self, run_dir, small_levels):
+        _run(run_dir)
+        (base, *_), *_ = _read_ome(run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_genes.ome.tif")
+        total, a, c, b, z = base
+        assert (total[4, 4], total[4, 8], total[15, 15], total[12, 16]) == (4, 3, 4, 0)
+        assert a[4, 4] == 3 and a[4, 8] == 1 and a[4, 6] == 0
+        assert c[4, 8] == 2 and b[15, 15] == 4 and not z.any()
+
+    def test_every_level_is_painted_from_the_mask(self, run_dir, small_levels):
+        _run(run_dir)
+        _, half, quarter = _read_ome(run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_genes.ome.tif")[0]
+        # 2x level: cells 1 and 2 are 2 x 2 px -- too small for a border, so both stay whole
+        assert half[1, 1, 2] == 3 and half[1, 1, 3] == 1       # GeneA of cell 1 | cell 2
+        assert half[3, 7, 7] == 4                               # cell 3 restored at this level too
+        assert set(np.unique(half)) <= {0, 1, 2, 3, 4}          # counts, never averaged
+        assert quarter[0].max() == 4 and (quarter[3] == 4).sum() >= 1
+
+    def test_roi_close_up(self, run_dir):
+        stats = _run(run_dir, fac=2, roi=(10, 70, 10, 110), use_all=True, gene_file=None)
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        (base, *_), names, px, _ = _read_ome(seg / "cellmap_Q20_all_y10-70_x10-110.ome.tif")
+        assert stats['map_shape'] == (30, 50) and base.shape == (4, 30, 50)
+        assert names == ['total', 'GeneA', 'GeneB', 'GeneC']
+        assert px == pytest.approx(0.325)
+        assert base[1, 15, 15] == 3                   # full-res (40, 40) -> ROI map (15, 15)
+
+    def test_fov_masked_run_is_named_and_counted_separately(self, run_dir):
+        _run(run_dir, exclude_fov_masked=True)
+        (base, *_), names, *_ = _read_ome(
+            run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_fovmasked_genes.ome.tif")
+        assert base[names.index('GeneC'), 4, 8] == 1  # one GeneC spot of cell 2 was fov-masked
+
+
+class TestImageJOutputs:
+    def test_stack_is_imagej_zip_with_gene_labels(self, run_dir):
+        stats = _run(run_dir, fmt='imagej')
         seg = run_dir / f"{RUN}_processed" / "segmented"
         stack, meta, compression, xres, cmap = _read_zip(seg / "cellmap_Q20_genes.zip")
         assert stack.shape == (4, 20, 24) and stack.dtype == np.uint8
@@ -170,32 +240,31 @@ class TestOutputs:
         assert (stats['n_restored'], stats['n_lost']) == (1, 0)
 
     def test_total_map(self, run_dir):
-        _run(run_dir)
+        _run(run_dir, fmt='imagej')
         total, meta, *_ = _read_zip(run_dir / f"{RUN}_processed" / "segmented" / "cellmap_Q20_total.zip")
         assert total.shape == (20, 24)
         assert (total[4, 4], total[4, 8], total[15, 15], total[12, 16]) == (4, 3, 4, 0)
         assert meta['Labels'] in ('total', ['total'])   # tifffile unwraps a single label
 
-    def test_fov_masked_run_is_named_and_counted_separately(self, run_dir):
-        _run(run_dir, exclude_fov_masked=True)
+    def test_fov_masked_total_is_named_to_match(self, run_dir):
+        _run(run_dir, fmt='imagej', exclude_fov_masked=True)
         seg = run_dir / f"{RUN}_processed" / "segmented"
         stack, *_ = _read_zip(seg / "cellmap_Q20_fovmasked_genes.zip")
-        assert stack[1, 4, 8] == 1                    # one GeneC spot of cell 2 was fov-masked
+        assert stack[1, 4, 8] == 1
         assert (seg / "cellmap_Q20_fovmasked_total.zip").is_file()
 
-    def test_roi_close_up(self, run_dir):
-        stats = _run(run_dir, fac=2, roi=(10, 70, 10, 110), use_all=True, gene_file=None)
-        seg = run_dir / f"{RUN}_processed" / "segmented"
-        stack, meta, *_ = _read_zip(seg / "cellmap_Q20_all_y10-70_x10-110.zip")
-        assert stats['map_shape'] == (30, 50)
-        assert meta['Labels'] == ['GeneA', 'GeneB', 'GeneC']
-        assert stack[0, 15, 15] == 3                  # full-res (40, 40) -> ROI map (15, 15)
-
     def test_plain_tif_output(self, run_dir):
-        _run(run_dir, output="custom.tif")
+        _run(run_dir, fmt='imagej', output="custom.tif")
         with tifffile.TiffFile(run_dir / f"{RUN}_processed" / "segmented" / "custom.tif") as tf:
             assert tf.imagej_metadata['Labels'][0] == 'GeneA'
 
+    def test_over_imagej_limit_fails_before_writing(self, run_dir, monkeypatch):
+        monkeypatch.setattr(cm, "IMAGEJ_MAX_BYTES", 1000)
+        with pytest.raises(ValueError, match="4 GiB"):
+            _run(run_dir, fmt='imagej')
+
+
+class TestGuards:
     def test_no_spots_passing_threshold_fails(self, run_dir):
         with pytest.raises(ValueError, match="No spots"):
             cli.run_pipeline(RUN, gene_file=str(run_dir / "genes.txt"), threshold=1.0,
@@ -205,10 +274,10 @@ class TestOutputs:
         _run(run_dir, roi=(160, 200, 0, 240))         # no spot inside this strip
         assert "Could not verify" in caplog.text
 
-    def test_over_imagej_limit_fails_before_writing(self, run_dir, monkeypatch):
-        monkeypatch.setattr(cm, "IMAGEJ_MAX_BYTES", 1000)
-        with pytest.raises(ValueError, match="4 GiB"):
-            _run(run_dir)
+    def test_unknown_format_rejected(self, run_dir):
+        with pytest.raises(ValueError, match="Unknown format"):
+            cm.build_cell_maps(None, cm.filter_spots(_spots(), 0.99), ['GeneA'], "x", fac=FAC,
+                               px_um=1.0, fmt='png')
 
 
 class TestCli:
@@ -231,5 +300,13 @@ class TestCli:
         monkeypatch.setattr("sys.argv", ["sprintseq", "cell-map", "--run-id", RUN,
                                          "--gene-file", str(run_dir / "genes.txt"), "-Q", "30"])
         main_mod.main()
-        assert seen['run_id'] == RUN and seen['label'] == "Q30" and seen['fac'] == cli.DEFAULT_FAC
+        assert seen['run_id'] == RUN and seen['label'] == "Q30"
+        assert seen['fmt'] == 'ome' and seen['fac'] is None       # resolved per format downstream
         assert seen['threshold'] == pytest.approx(0.999)
+
+    def test_default_resolution_follows_format(self):
+        assert cli.DEFAULT_FAC == {'ome': 4, 'imagej': 10}
+
+    def test_pyramid_stops_once_the_top_level_is_small(self):
+        assert cm.pyramid_steps((10006, 12763)) == [1, 2, 4, 8, 16]
+        assert cm.pyramid_steps((500, 800)) == [1]
