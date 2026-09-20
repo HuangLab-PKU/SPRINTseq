@@ -256,8 +256,14 @@ class TestImageJOutputs:
 
     def test_plain_tif_output(self, run_dir):
         _run(run_dir, fmt='imagej', output="custom.tif")
-        with tifffile.TiffFile(run_dir / f"{RUN}_processed" / "segmented" / "custom.tif") as tf:
+        seg = run_dir / f"{RUN}_processed" / "segmented"
+        with tifffile.TiffFile(seg / "custom.tif") as tf:
             assert tf.imagej_metadata['Labels'][0] == 'GeneA'
+        # the total map follows the stack's container, so a collaborator who was handed
+        # plain TIFFs never has to unpack an ImageJ-ZIP for the totals
+        assert not (seg / "cellmap_Q20_total.zip").exists()
+        with tifffile.TiffFile(seg / "cellmap_Q20_total.tif") as tf:
+            assert tf.pages[0].compression == 1          # plain ImageJ can read it
 
     def test_over_imagej_limit_fails_before_writing(self, run_dir, monkeypatch):
         monkeypatch.setattr(cm, "IMAGEJ_MAX_BYTES", 1000)

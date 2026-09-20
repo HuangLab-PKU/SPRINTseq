@@ -134,7 +134,11 @@ def run_pipeline(run_id, *, gene_file=None, use_all=False, threshold=DEFAULT_THR
     stem = 'all' if use_all else Path(gene_file).stem
     suffix = '.ome.tif' if fmt == 'ome' else '.zip'
     out_path = seg_dir / (output or f'{tag}_{stem}{roi_tag}{suffix}')
-    total_path = seg_dir / f'{tag}_total{roi_tag}.zip' if fmt == 'imagej' else None
+    # The total map follows the stack's container: `--output name.tif` (a plain ImageJ TIFF,
+    # what a collaborator without Bio-Formats can double-click) must not leave the total as a
+    # .zip beside it.
+    total_suffix = '.tif' if out_path.name.lower().endswith('.tif') else '.zip'
+    total_path = seg_dir / f'{tag}_total{roi_tag}{total_suffix}' if fmt == 'imagej' else None
     geo_name = out_path.name
     for ext in ('.ome.tif', '.zip', '.tif'):
         if geo_name.lower().endswith(ext):
