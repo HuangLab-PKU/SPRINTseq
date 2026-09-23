@@ -13,6 +13,8 @@ class TestFillMissingGenes:
         tifffile.imwrite(str(density_dir / "CD3D.tif"), np.ones((10, 20), dtype=np.uint16))
         tifffile.imwrite(str(density_dir / "CD8A.tif"), np.full((10, 20), 5, dtype=np.uint16))
 
+        # Synthetic barcodes: the test asserts which genes get a zero-filled TIFF and never
+        # reads the codeword, so no real design sequence belongs in this (public) repository.
         codebook = tmp_path / "codebook.csv"
         codebook.write_text(
             "No.,Gene,Barcode\n"

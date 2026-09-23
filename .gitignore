@@ -296,3 +296,9 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,linux,macos,python,matlab
+# Codeword design space (10-nt barcodes). This repository is PUBLIC: the lab's sequences --
+# probe arms, codewords, primer sites, and tables derived from them -- live in the Gitea-only
+# probe-design repos, never here. The generator in sprintseq/barcode_design/ stays; its output
+# does not.
+sprintseq/barcode_design/*.txt
+src/barcode_design/*.txt
