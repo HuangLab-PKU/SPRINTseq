@@ -9,6 +9,7 @@ Subcommands:
     density         Per-gene downsampled density TIFFs.
     segment         Cell segmentation + RNA-to-cell assignment.
     cell-map        Per-cell gene maps: segmented cells painted with their counts.
+    spot-map        Transcript points for QuPath (one MultiPoint per gene, or per spot).
 
 Run `sprintseq <subcommand> --help` for details on each.
 """
@@ -26,6 +27,7 @@ from sprintseq.cli import density_stack as ds_mod
 from sprintseq.cli import gene_calling as gc_mod
 from sprintseq.cli import readout as readout_mod
 from sprintseq.cli import segment as segment_mod
+from sprintseq.cli import spotmap as spotmap_mod
 from sprintseq.cli import parse_cycles, parse_channels, resolve_threshold_and_label
 
 
@@ -417,6 +419,42 @@ def _build_cell_map(sub):
     p.set_defaults(_func=cellmap_mod.run_from_args)
 
 
+def _build_spot_map(sub):
+    p = sub.add_parser(
+        "spot-map",
+        help="Transcript points for QuPath (one MultiPoint per gene, or per spot).",
+        description=(
+            "The spot layer under the per-cell gene maps: the decoded transcripts as QuPath "
+            "objects, in full-resolution mosaic pixels, so they overlay stitched/mosaic.ome.tif "
+            "and the cell outlines from cell-map.\n\n"
+            "Default: ONE annotation per gene holding every spot of that gene as a MultiPoint "
+            "-- ~10^2 objects for a whole section, so QuPath pans at full speed, and each gene "
+            "is toggled through its classification (colour is derived from the gene name, so it "
+            "is the same in every run).\n\n"
+            "--per-spot: one detection per transcript carrying its Probability and Cell ID, for "
+            "a crop or a couple of genes. A million individual objects make QuPath crawl, so "
+            "this is refused above the object limit unless you narrow it (--genes / --roi / a "
+            "higher -Q) or pass --force.\n\n"
+            "Reads segmented/assigned_spots.csv when the run is segmented (that is where Cell ID "
+            "comes from), else readout/position.csv + mapping_postcode.csv."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  # whole section, every gene -> segmented/spots_Q20.geojson\n"
+            "  sprintseq spot-map --run-id <id> --all\n\n"
+            "  # decode-masked tiles dropped, as in the fovmasked matrices\n"
+            "  sprintseq spot-map --run-id <id> --all --exclude-fov-masked\n\n"
+            "  # two genes, every transcript individually selectable\n"
+            "  sprintseq spot-map --run-id <id> --genes CD3E,KRT19 --per-spot\n\n"
+            "  # a 4000 x 4000 px crop, per spot\n"
+            "  sprintseq spot-map --run-id <id> --all --roi 20000:24000,30000:34000 --per-spot"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    spotmap_mod.add_arguments(p)
+    p.set_defaults(_func=spotmap_mod.run_from_args)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="sprintseq",
@@ -434,7 +472,8 @@ def main():
             "  density         Per-gene density TIFFs.\n"
             "  density-stack   Composite density stack with thermal LUT.\n"
             "  segment         Cell segmentation + RNA-to-cell assignment.\n"
-            "  cell-map        Per-cell gene maps (cells painted with counts).\n\n"
+            "  cell-map        Per-cell gene maps (cells painted with counts).\n"
+            "  spot-map        Transcript points for QuPath.\n\n"
             "Example end-to-end:\n"
             "  sprintseq readout       --run-id <id>\n"
             "  sprintseq gene-calling  --run-id <id> --ref-file <codebook.csv>\n"
@@ -442,10 +481,12 @@ def main():
             "  sprintseq density-stack --run-id <id> --gene-file markers.txt\n"
             "  sprintseq segment       --run-id <id> --model <validated-model>\n"
             "  sprintseq cell-map      --run-id <id> --gene-file markers.txt\n"
+            "  sprintseq spot-map      --run-id <id> --all\n"
         ),
     )
     sub = parser.add_subparsers(dest="command",
-                                metavar="{readout,gene-calling,density,density-stack,segment,cell-map}")
+                                metavar="{readout,gene-calling,density,density-stack,segment,"
+                                        "cell-map,spot-map}")
 
     _build_readout(sub)
     _build_gene_calling(sub)
@@ -453,6 +494,7 @@ def main():
     _build_density_stack(sub)
     _build_segment(sub)
     _build_cell_map(sub)
+    _build_spot_map(sub)
 
     args = parser.parse_args()
 
