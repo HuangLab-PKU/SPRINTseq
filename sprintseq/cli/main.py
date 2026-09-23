@@ -4,6 +4,7 @@ Usage:
     sprintseq <subcommand> [options]
 
 Subcommands:
+    codebook        Fetch the run's decoding codebook from probe-bank.
     readout         Spot detection + intensity readout from stitched images.
     gene-calling    Intensity correction (optional) + gene mapping.
     density         Per-gene downsampled density TIFFs.
@@ -22,6 +23,7 @@ from pathlib import Path
 # These imports are lazy where possible to keep --help fast and avoid pulling
 # in heavy deps before the user chooses a subcommand.
 from sprintseq.cli import cellmap as cellmap_mod
+from sprintseq.cli import codebook as codebook_mod
 from sprintseq.cli import density as density_mod
 from sprintseq.cli import density_stack as ds_mod
 from sprintseq.cli import gene_calling as gc_mod
@@ -29,6 +31,36 @@ from sprintseq.cli import readout as readout_mod
 from sprintseq.cli import segment as segment_mod
 from sprintseq.cli import spotmap as spotmap_mod
 from sprintseq.cli import parse_cycles, parse_channels, resolve_threshold_and_label
+
+
+def _build_codebook(sub):
+    p = sub.add_parser(
+        "codebook",
+        help="Fetch the run's decoding codebook from probe-bank and snapshot it.",
+        description=codebook_mod.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--run-id", type=str, required=True,
+                   help="Run identifier; must be recorded in probe-bank with its pools.")
+    p.add_argument("--bank", type=str, default=None,
+                   help=f"probe-bank base URL (default: $SPRINTSEQ_PROBE_BANK or {codebook_mod.DEFAULT_BANK}).")
+    p.add_argument("--out-dir", type=str, default=None,
+                   help="Where to write codebook.csv + codebook.json "
+                        "(default: <RUN_ID>_processed/codebook/).")
+    p.add_argument("--min-hamming", type=int, default=3,
+                   help="Refuse a codebook with a codeword pair closer than this (default: 3).")
+    p.add_argument("--force", action="store_true",
+                   help="Replace an existing snapshot that differs.")
+    p.set_defaults(_func=_run_codebook)
+
+
+def _run_codebook(args):
+    try:
+        codebook_mod.run(args.run_id, bank=args.bank, out_dir=args.out_dir,
+                         min_hamming=args.min_hamming, force=args.force)
+    except codebook_mod.CodebookError as exc:
+        logging.getLogger("sprintseq.codebook").error("%s", exc)
+        sys.exit(1)
 
 
 def _build_readout(sub):
@@ -467,7 +499,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Subcommands:\n"
-            "  readout         Spot detection + intensity readout.\n"
+            "  codebook        Fetch the run's codebook from probe-bank.\n"
+            "  readout        Spot detection + intensity readout.\n"
             "  gene-calling    Gene mapping (postcode / threshold / ...).\n"
             "  density         Per-gene density TIFFs.\n"
             "  density-stack   Composite density stack with thermal LUT.\n"
@@ -475,8 +508,9 @@ def main():
             "  cell-map        Per-cell gene maps (cells painted with counts).\n"
             "  spot-map        Transcript points for QuPath.\n\n"
             "Example end-to-end:\n"
+            "  sprintseq codebook      --run-id <id>\n"
             "  sprintseq readout       --run-id <id>\n"
-            "  sprintseq gene-calling  --run-id <id> --ref-file <codebook.csv>\n"
+            "  sprintseq gene-calling  --run-id <id> --ref-file <id>_processed/codebook/codebook.csv\n"
             "  sprintseq density       --run-id <id>\n"
             "  sprintseq density-stack --run-id <id> --gene-file markers.txt\n"
             "  sprintseq segment       --run-id <id> --model <validated-model>\n"
@@ -485,9 +519,10 @@ def main():
         ),
     )
     sub = parser.add_subparsers(dest="command",
-                                metavar="{readout,gene-calling,density,density-stack,segment,"
+                                metavar="{codebook,readout,gene-calling,density,density-stack,segment,"
                                         "cell-map,spot-map}")
 
+    _build_codebook(sub)
     _build_readout(sub)
     _build_gene_calling(sub)
     _build_density(sub)

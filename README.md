@@ -55,13 +55,16 @@ After install a single `sprintseq` command is on `PATH`, dispatching these subco
 
 ```powershell
 sprintseq --help                                                              # subcommand list
+sprintseq codebook      --run-id <RUN_ID> [--bank <url>] [--out-dir <dir>] [--min-hamming 3] [--force]
 sprintseq readout       --run-id <RUN_ID> [--detection-cycles 1-4,11] [--seq-cycles 10] [--channels cy3,cy5] [--n-workers 4]
-sprintseq gene-calling  --run-id <RUN_ID> --ref-file <codebook.csv> [--seq-cycles 10] [--channels cy3,cy5]
+sprintseq gene-calling  --run-id <RUN_ID> --ref-file <RUN_ID>_processed/codebook/codebook.csv [--seq-cycles 10] [--channels cy3,cy5]
 sprintseq density       --run-id <RUN_ID> [--threshold 0.95] [--fac 200]
 sprintseq density-stack --run-id <RUN_ID> {--gene-file <genes.txt> | --all} [-Q 20] [--sigma 0.7]
 sprintseq segment       --run-id <RUN_ID> [--dapi <path>] [--morphology <file>]... [--model <name>] [--method {auto,cellsam,cellpose,nuclei-kdtree}]
 sprintseq cell-map      --run-id <RUN_ID> {--gene-file <genes.txt> | --all} [-Q 20] [--format {ome,imagej}] [--fac N] [--roi y0:y1,x0:x1] [--exclude-fov-masked]
 ```
+
+`codebook` asks probe-bank (`$SPRINTSEQ_PROBE_BANK`, default `http://10.10.10.1:8001`) for the run's decoding codebook -- derived from the pools the run records in the probe ledger (marker tube + the sample's TCR / allele tubes), labelled for analysis, with the run's decoys -- and snapshots it as `<RUN_ID>_processed/codebook/codebook.csv` (No., Gene, Barcode) plus `codebook.json` (pools, design versions, ledger commit, audit). The snapshot is the record of what the run was decoded with: a differing one is not replaced without `--force`, and an ambiguous codebook is refused. A run the ledger does not know yet has to be recorded there first (probe_design `bank/scripts/record_mix_guide_pools.py` + `record_run.py`).
 
 `cell-map` is the cell-level counterpart of `density-stack`: after `segment`, every cell's mask footprint is filled with its count for each gene (P > threshold, the same cut as density), so the maps show real cell positions and shapes and the pixel value is the per-cell count. Touching cells get a 1-px black border; cells smaller than one map pixel are kept as a pixel at their centroid. Outputs land in `segmented/`:
 
