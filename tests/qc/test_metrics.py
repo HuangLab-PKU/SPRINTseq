@@ -4,7 +4,6 @@ import pytest
 
 from sprintseq.qc.metrics import (
     compute_alert_flags,
-    compute_density_metrics,
     compute_gene_calling_metrics,
     compute_intensity_summary,
     compute_phred_qscore,
@@ -158,27 +157,3 @@ class TestAlertFlags:
         }
         flags = compute_alert_flags(metrics)
         assert len(flags) == 0
-
-
-# ---------- compute_density_metrics ----------
-
-class TestDensityMetrics:
-    def test_coverage_full(self):
-        cube = np.ones((2, 5, 5), dtype=np.uint16)
-        genes = np.array(["A", "B"])
-        df = pd.DataFrame({"Y": [0], "X": [0], "Gene": ["A"], "Probability": [0.99]})
-        m = compute_density_metrics(df, cube, genes, threshold=0.95, fac=200)
-        assert m["spatial_coverage"] == pytest.approx(1.0)
-
-    def test_coverage_empty(self):
-        cube = np.zeros((2, 5, 5), dtype=np.uint16)
-        genes = np.array(["A", "B"])
-        df = pd.DataFrame({"Y": [0], "X": [0], "Gene": ["A"], "Probability": [0.99]})
-        m = compute_density_metrics(df, cube, genes, threshold=0.95, fac=200)
-        assert m["spatial_coverage"] == pytest.approx(0.0)
-
-    def test_per_gene_sorted_descending(self, synthetic_density_data):
-        df, cube, genes = synthetic_density_data
-        m = compute_density_metrics(df, cube, genes, threshold=0.5, fac=200)
-        counts = [g["count"] for g in m["per_gene_counts"]]
-        assert counts == sorted(counts, reverse=True)

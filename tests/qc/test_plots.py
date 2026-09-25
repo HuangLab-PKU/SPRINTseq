@@ -6,7 +6,6 @@ import pandas as pd
 import pytest
 
 from sprintseq.qc.plots import (
-    plot_density_qc,
     plot_gene_calling_qc,
     plot_readout_qc,
 )
@@ -37,17 +36,6 @@ def gene_calling_qc_inputs(synthetic_mapping_result):
     prob = synthetic_mapping_result["Probability"].to_numpy()
     entropy = synthetic_mapping_result["Entropy"].to_numpy()
     return metrics, prob, entropy, synthetic_mapping_result
-
-
-@pytest.fixture
-def density_qc_inputs():
-    per_gene_counts = [
-        {"gene": "GeneA", "count": 100},
-        {"gene": "GeneB", "count": 80},
-        {"gene": "GeneC", "count": 50},
-    ]
-    total_density = np.random.default_rng(0).integers(0, 20, (10, 10))
-    return per_gene_counts, total_density
 
 
 class TestPlotReadoutQC:
@@ -93,18 +81,4 @@ class TestPlotGeneCallingQC:
             metrics, df["Probability"].values, df["Entropy"].values, df
         )
         assert isinstance(fig, plt.Figure)
-        plt.close(fig)
-
-
-class TestPlotDensityQC:
-    def test_returns_figure(self, density_qc_inputs):
-        counts, density = density_qc_inputs
-        fig = plot_density_qc(counts, density)
-        assert isinstance(fig, plt.Figure)
-        plt.close(fig)
-
-    def test_axes_count(self, density_qc_inputs):
-        counts, density = density_qc_inputs
-        fig = plot_density_qc(counts, density)
-        assert len(fig.axes) >= 2
         plt.close(fig)

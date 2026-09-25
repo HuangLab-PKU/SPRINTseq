@@ -12,13 +12,12 @@ import pandas as pd
 
 from .metrics import (
     compute_alert_flags,
-    compute_density_metrics,
     compute_gene_calling_metrics,
     compute_intensity_summary,
     compute_pipeline_funnel,
     compute_spatial_density_grid,
 )
-from .plots import plot_density_qc, plot_gene_calling_qc, plot_readout_qc
+from .plots import plot_gene_calling_qc, plot_readout_qc
 
 
 def _serialize(obj):
@@ -142,52 +141,6 @@ def generate_gene_calling_qc(
     entropy = np.nan_to_num(result_df["Entropy"].to_numpy(dtype=np.float64), nan=0.0) if len(result_df) > 0 else np.array([])
     fig = plot_gene_calling_qc(metrics, prob, entropy, result_df)
     fig.savefig(output_dir / "gene_calling_qc.png", dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    return json_path
-
-
-def generate_density_qc(
-    df_filtered: pd.DataFrame,
-    density_cube: np.ndarray,
-    gene_names: np.ndarray,
-    output_dir,
-    run_id: str,
-    threshold: float,
-    fac: int,
-    density_label: str = None,
-) -> Path:
-    """Generate density QC JSON report + PNG figure.
-
-    Parameters
-    ----------
-    density_label : str, optional
-        Label for output filenames, e.g. ``'Q20'``.  Produces
-        ``density_Q20_qc.json`` / ``.png``.  Defaults to ``str(threshold)``.
-    """
-    import matplotlib.pyplot as plt
-
-    output_dir = Path(output_dir)
-    if density_label is None:
-        density_label = str(threshold)
-
-    metrics = compute_density_metrics(df_filtered, density_cube, gene_names, threshold, fac)
-    total_density = density_cube.sum(axis=0)
-
-    report = {
-        "run_id": run_id,
-        "timestamp": datetime.now().isoformat(),
-        "density_label": density_label,
-        **metrics,
-    }
-
-    stem = f"density_{density_label}_qc"
-    json_path = output_dir / f"{stem}.json"
-    _dump_json(report, json_path)
-
-    fig = plot_density_qc(metrics["per_gene_counts"], total_density,
-                          title=f"Density QC ({density_label})")
-    fig.savefig(output_dir / f"{stem}.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
     return json_path

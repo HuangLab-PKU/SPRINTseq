@@ -1,27 +1,11 @@
-"""Cell segmentation and RNA-to-cell assignment."""
+"""Moved to spatial-cells: :mod:`spatial_cells.segment` (cell segmentation + RNA assignment).
 
-from .utils import (
-    load_and_merge_spots,
-    prepare_cellsam_input,
-    prepare_cellpose_input,
-    run_cellsam_segmentation,
-    run_cellpose_segmentation,
-    assign_spots_to_cells,
-    assign_spots_to_nuclei_kdtree,
-    extract_cell_positions,
-    auto_detect_dapi,
-    auto_detect_morphology,
-)
+Import shim for scripts written before the split; see :mod:`sprintseq._moved`.
+"""
+from sprintseq._moved import forward_attr as _forward
 
-__all__ = [
-    "load_and_merge_spots",
-    "prepare_cellsam_input",
-    "prepare_cellpose_input",
-    "run_cellsam_segmentation",
-    "run_cellpose_segmentation",
-    "assign_spots_to_cells",
-    "assign_spots_to_nuclei_kdtree",
-    "extract_cell_positions",
-    "auto_detect_dapi",
-    "auto_detect_morphology",
-]
+_NEW = ("spatial_cells.segment",)
+
+
+def __getattr__(name):
+    return _forward(__name__, _NEW, name)

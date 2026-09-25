@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sprintseq"
-version = "0.1.0"
-description = "Official analysis pipeline for SPRINTseq (Chang et al., PNAS 2023, doi:10.1073/pnas.2309227120) — post-stitched spot detection, gene calling, density maps, and cell segmentation."
+version = "0.2.0"
+description = "Official analysis pipeline for SPRINTseq (Chang et al., PNAS 2023, doi:10.1073/pnas.2309227120) — post-stitched spot detection, intensity readout and gene calling."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "HuangLab-PKU" }]
@@ -33,18 +33,16 @@ dependencies = [
     "seaborn",
 ]
 
-# Optional DL extras. Only `spotiflow` and `cellpose` exist on PyPI under these
-# exact names, so only they are safely installable via `pip install sprintseq[...]`.
-# `cellSAM` and `postcode` (the HuangLab fork) are NOT on PyPI — install them
-# as editable packages from the vendored trees:
+# Optional DL extras. Only `spotiflow` exists on PyPI under this exact name, so only it is
+# safely installable via `pip install sprintseq[...]`. `postcode` (the HuangLab fork) is NOT
+# on PyPI — install it as an editable package from the vendored tree:
 #
 #     pip install -e <SPRINTseq>/experiments/src/postcode
-#     pip install -e <SPRINTseq>/experiments/src/cellsam
 #
-# See common_failures.md in the sprintseq-pipeline skill for the full install order.
+# Segmentation (CellSAM / Cellpose) moved to the spatial-cells package with the rest of the
+# downstream. See common_failures.md in the sprintseq-pipeline skill for the install order.
 [project.optional-dependencies]
 detection-dl = ["spotiflow"]
-cellpose     = ["cellpose"]
 test         = ["pytest"]
 
 [project.urls]

@@ -213,30 +213,3 @@ def compute_alert_flags(metrics: dict) -> list:
         })
 
     return flags
-
-
-def compute_density_metrics(
-    df: pd.DataFrame,
-    density_cube: np.ndarray,
-    gene_names: np.ndarray,
-    threshold: float,
-    fac: int,
-) -> dict:
-    """QC metrics for the density stage."""
-    total_density = density_cube.sum(axis=0)
-    n_bins = total_density.size
-    n_occupied = int((total_density > 0).sum())
-
-    per_gene = []
-    for i, gene in enumerate(gene_names):
-        per_gene.append({"gene": str(gene), "count": int(density_cube[i].sum())})
-    per_gene.sort(key=lambda g: g["count"], reverse=True)
-
-    return {
-        "total_spots": int(len(df)),
-        "n_genes": int(len(gene_names)),
-        "threshold": threshold,
-        "fac": fac,
-        "per_gene_counts": per_gene,
-        "spatial_coverage": n_occupied / n_bins if n_bins > 0 else 0.0,
-    }

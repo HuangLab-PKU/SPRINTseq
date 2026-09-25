@@ -7,7 +7,6 @@ import pandas as pd
 import pytest
 
 from sprintseq.qc.report import (
-    generate_density_qc,
     generate_gene_calling_qc,
     generate_readout_qc,
 )
@@ -95,39 +94,6 @@ class TestGenerateGeneCallingQC:
             with open(Path(tmpdir) / "gene_calling_qc.json") as f:
                 data = json.load(f)
             assert "convergence" in data
-
-
-class TestGenerateDensityQC:
-    def test_creates_files(self, synthetic_density_data):
-        df, cube, genes = synthetic_density_data
-        with tempfile.TemporaryDirectory() as tmpdir:
-            generate_density_qc(
-                df_filtered=df,
-                density_cube=cube,
-                gene_names=genes,
-                output_dir=tmpdir,
-                run_id="test_run",
-                threshold=0.95,
-                fac=200,
-                density_label="Q20",
-            )
-            assert (Path(tmpdir) / "density_Q20_qc.json").exists()
-            assert (Path(tmpdir) / "density_Q20_qc.png").exists()
-
-    def test_default_label(self, synthetic_density_data):
-        df, cube, genes = synthetic_density_data
-        with tempfile.TemporaryDirectory() as tmpdir:
-            generate_density_qc(
-                df_filtered=df,
-                density_cube=cube,
-                gene_names=genes,
-                output_dir=tmpdir,
-                run_id="test_run",
-                threshold=0.95,
-                fac=200,
-            )
-            assert (Path(tmpdir) / "density_0.95_qc.json").exists()
-            assert (Path(tmpdir) / "density_0.95_qc.png").exists()
 
 
 class TestQCHandlesEmpty:

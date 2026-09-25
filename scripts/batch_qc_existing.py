@@ -143,7 +143,7 @@ def run_qc_for_run(run_id: str):
             df["Gene"] = df["Gene"].map(_parse_gene)
             df = df[df["Probability"] > DENSITY_THRESHOLD]
 
-            from sprintseq.qc import generate_density_qc
+            from spatial_cells.qc import generate_density_qc   # density QC moved to spatial-cells
             generate_density_qc(
                 df_filtered=df,
                 density_cube=cube,
