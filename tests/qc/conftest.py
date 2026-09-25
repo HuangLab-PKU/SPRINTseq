@@ -52,22 +52,3 @@ def synthetic_mapping_result():
             "Entropy": entropy,
         }
     )
-
-
-@pytest.fixture
-def synthetic_density_data():
-    """200 filtered spots, 3 genes, 10x10 density cube."""
-    rng = np.random.default_rng(42)
-    n = 200
-    genes = np.array(["GeneA", "GeneB", "GeneC"])
-    gene_col = genes[rng.integers(0, 3, size=n)]
-    df = pd.DataFrame(
-        {
-            "Y": rng.uniform(0, 2000, n),
-            "X": rng.uniform(0, 2000, n),
-            "Gene": gene_col,
-            "Probability": rng.beta(8, 2, size=n),
-        }
-    )
-    density_cube = rng.integers(0, 10, size=(3, 10, 10), dtype=np.uint16)
-    return df, density_cube, genes

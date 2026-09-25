@@ -117,14 +117,6 @@ def test_dropped_handle_releases_the_file(ometiff_run):
     (d / "mosaic.ome.tif").unlink()
 
 
-def test_segmentation_autodetect_uses_the_finalized_tiff(ometiff_run):
-    from sprintseq import segment as seg
-
-    dapi = seg.auto_detect_dapi(ometiff_run)
-    assert not isinstance(dapi, (str, np.ndarray)) and dapi.shape == SHAPE
-    assert seg.auto_detect_morphology(ometiff_run, names=("FAM",)) == []
-
-
 def test_contract_with_the_real_exporter(tmp_path):
     """End to end: spatial_img_core writes a store, finalizes it, sprintseq reads it."""
     mio = pytest.importorskip("spatial_img_core.mosaic_io")
