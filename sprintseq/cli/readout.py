@@ -69,9 +69,15 @@ SPOTIFLOW_PROB_THRESH = 0.01
 #   'block'  -- Spotiflow's own default: each 2048^2 block by its own p1/p99.8, so a
 #               block's contrast depends on what else is in it.
 #   'global' -- one p1/p99.8 per mosaic (cycle x channel), estimated by
-#               spot_detection.mosaic_percentiles and shared by all its blocks.
+#               spot_detection.mosaic_percentiles from 144 sampled 512^2 windows (~75 MB
+#               read, never the whole mosaic) and shared by all its blocks.
+# 'global' since 2026-09-26: on a 6144^2 BZ10 full_TCR crop, full readout + postcode per arm,
+# it gave +0.9 % targets at P > 0.99, +2.4 % at calibrated qv >= 20 and -14 % Background calls
+# vs 'block'; spots only it found decoded as confident targets 2.3x as often (18.9 % vs 8.2 %).
+# A few spots fewer in near-empty blocks. Tuning prob_thresh in the notebook on ROI crops
+# normalises each crop by itself; pass norm_range=mosaic_percentiles(mosaic) to match.
 SPOTIFLOW_NORMALIZATIONS = ('block', 'global')
-SPOTIFLOW_NORMALIZATION = 'block'
+SPOTIFLOW_NORMALIZATION = 'global'
 
 # Intensity readout — sequencing cycles are consecutive 1..SEQ_CYCLE
 SEQ_CYCLE = 10

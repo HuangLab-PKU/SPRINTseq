@@ -118,8 +118,10 @@ class TestGetSpotCoordinatesNormalizer:
 
 
 class TestConfig:
-    def test_default_is_a_known_mode(self):
-        assert ro.SPOTIFLOW_NORMALIZATION in ro.SPOTIFLOW_NORMALIZATIONS
+    def test_default_is_global(self):
+        """Chosen on a real BZ10 crop (readout.py comment); 'block' stays available."""
+        assert ro.SPOTIFLOW_NORMALIZATION == "global"
+        assert set(ro.SPOTIFLOW_NORMALIZATIONS) == {"block", "global"}
 
     def test_unknown_mode_is_rejected(self, tmp_path):
         with pytest.raises(ValueError, match="spotiflow_normalization"):
