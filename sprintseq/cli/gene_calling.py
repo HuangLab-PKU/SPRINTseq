@@ -309,12 +309,6 @@ def run_pipeline(run_id=None, ref_file=None, seq_cycle=None, channels=None):
     if not ref_file.exists():
         raise FileNotFoundError(f"Reference file not found at {ref_file}")
     
-    # Get balance factors from correction info (if available)
-    # Data was already balanced in Step 2, so we can use those factors for per_round_max
-    balance_factors = None
-    if correction_info.get('balance_corrected', False):
-        balance_factors = correction_info.get('balance_factors', None)
-    
     # Test each mapping method and save immediately after each completes
     mapping_stats = {}
     saved_files = []

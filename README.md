@@ -26,7 +26,7 @@ If you use SPRINTseq in your work, please cite:
 | Subpackage | Purpose |
 |---|---|
 | `sprintseq.readout` | Block-based spot detection (Spotiflow / DoG + tophat) and intensity readout from stitched images. |
-| `sprintseq.gene_calling` | Intensity correction (channel balance, decay, phasing) and gene mapping (postcode / threshold / intensity-direct / per-round-max). |
+| `sprintseq.gene_calling` | Intensity correction (channel balance, decay, phasing) and gene mapping (postcode / threshold / intensity-direct). |
 | `sprintseq.qc` | Readout and gene-calling QC reports. |
 | `sprintseq.barcode_design` | Barcode graph design utilities (offline codebook generation). |
 
