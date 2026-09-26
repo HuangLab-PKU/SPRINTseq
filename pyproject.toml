@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sprintseq"
-version = "0.2.0"
+version = "0.3.0"
 description = "Official analysis pipeline for SPRINTseq (Chang et al., PNAS 2023, doi:10.1073/pnas.2309227120) — post-stitched spot detection, intensity readout and gene calling."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -36,6 +36,59 @@ def _get_spotiflow_model(model_path=None, pretrained_name='general', verbose=Fal
     return _SPOTIFLOW_MODEL
 
 
+# Spotiflow's default normalizer (``normalizer="auto"``): p1 / p99.8 of the image it is given.
+SPOTIFLOW_PMIN = 1.0
+SPOTIFLOW_PMAX = 99.8
+
+
+def mosaic_percentiles(img, pmin=SPOTIFLOW_PMIN, pmax=SPOTIFLOW_PMAX, window=512, grid=12,
+                       ignore_val=0):
+    """Whole-mosaic intensity percentiles, estimated from a regular grid of windows.
+
+    Spotiflow's ``normalizer="auto"`` rescales every call by that call's own p1/p99.8, so a
+    block-wise pass gives every block its own contrast: a tissue-free block has its noise
+    stretched to full range, a dense bright block pushes its dim spots down. Normalizing all
+    blocks of one mosaic by one ``(mi, ma)`` makes a spot's score independent of which block
+    it landed in. This estimates that pair.
+
+    ``grid x grid`` windows of ``window x window`` pixels, evenly spaced over the mosaic, keep
+    the read small on lazy (memmap / tiled OME-TIFF / zarr) mosaics. Pixels equal to
+    ``ignore_val`` -- stitching padding outside the scanned area -- are left out, as they
+    would otherwise pin the low percentile to 0.
+
+    Returns ``(mi, ma)`` as floats. Raises ``ValueError`` when every sampled pixel equals
+    ``ignore_val`` (nothing to normalize against).
+    """
+    h, w = img.shape[-2:]
+    wy, wx = min(window, h), min(window, w)
+    ys = np.unique(np.linspace(0, h - wy, grid).astype(np.int64))
+    xs = np.unique(np.linspace(0, w - wx, grid).astype(np.int64))
+    samples = []
+    for y in ys:
+        for x in xs:
+            a = np.asarray(img[y:y + wy, x:x + wx]).ravel()
+            if ignore_val is not None:
+                a = a[a != ignore_val]
+            samples.append(a)
+    s = np.concatenate(samples)
+    if s.size == 0:
+        raise ValueError(f"every sampled pixel equals ignore_val={ignore_val!r}")
+    mi, ma = np.percentile(s, (pmin, pmax))
+    return float(mi), float(ma)
+
+
+def fixed_range_normalizer(mi, ma):
+    """A Spotiflow ``normalizer`` that maps ``[mi, ma]`` to ``[0, 1]`` for every image.
+
+    Uses the same ``csbdeep.utils.normalize_mi_ma`` as Spotiflow's own ``normalize``, so it is
+    exactly ``normalizer="auto"`` with the percentiles fixed instead of recomputed per call.
+    """
+    import functools
+
+    from csbdeep.utils import normalize_mi_ma
+
+    return functools.partial(normalize_mi_ma, mi=mi, ma=ma, clip=False)
+
 
 def feature_dog(image, sigma1=1.2, sigma2=2.5, normalize_percentile=99.9):
     """Extract features using Difference of Gaussians (DoG) only (no pre-smoothing).
@@ -624,7 +677,8 @@ def get_spot_coordinates(image, method='spotiflow', min_distance=2, **kwargs):
     **kwargs
         Additional parameters for the detection method.
         For traditional methods: 'snr' sets threshold as snr * image_median.
-        For 'spotiflow': 'model_path', 'pretrained_name', 'device', 'prob_thresh'.
+        For 'spotiflow': 'model_path', 'pretrained_name', 'device', 'prob_thresh',
+        'norm_range' ((mi, ma) to normalize by instead of this image's own p1/p99.8).
         For 'blob_log': 'min_sigma', 'max_sigma', 'num_sigma', 'threshold', 'overlap'.
 
     Returns
@@ -656,15 +710,18 @@ def get_spot_coordinates(image, method='spotiflow', min_distance=2, **kwargs):
         prob_thresh = kwargs.pop('prob_thresh', None)
         subpix = kwargs.pop('subpix', None)
         verbose = kwargs.pop('verbose', False)
-        
+        # (mi, ma) shared by every block of a mosaic (see mosaic_percentiles); None keeps
+        # Spotiflow's per-call p1/p99.8.
+        norm_range = kwargs.pop('norm_range', None)
+        normalizer = 'auto' if norm_range is None else fixed_range_normalizer(*norm_range)
+
         # Get global model instance (lazy loading, shared within process)
         model = _get_spotiflow_model(model_path, pretrained_name, verbose)
-        
+
         # Determine device
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        # Predict spots (Spotiflow handles format conversion and normalization internally)
+
         with torch.no_grad():
             spots, details = model.predict(
                 image,
@@ -673,6 +730,7 @@ def get_spot_coordinates(image, method='spotiflow', min_distance=2, **kwargs):
                 verbose=verbose,
                 min_distance=min_distance,
                 device=device,
+                normalizer=normalizer,
             )
         
         # Cleanup to prevent OOM
