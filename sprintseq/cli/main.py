@@ -123,6 +123,13 @@ def _build_readout(sub):
              f"feature-extraction methods backed by find_maxima. "
              f"(default: {readout_mod.DETECTION_METHOD!r})",
     )
+    p.add_argument(
+        "--spotiflow-normalization", type=str, default=None,
+        choices=list(readout_mod.SPOTIFLOW_NORMALIZATIONS),
+        help=f"How Spotiflow input is scaled: 'block' = each block by its own p1/p99.8 "
+             f"(Spotiflow's default), 'global' = one p1/p99.8 per mosaic shared by all "
+             f"its blocks. (default: {readout_mod.SPOTIFLOW_NORMALIZATION!r})",
+    )
     p.set_defaults(_func=_run_readout)
 
 
@@ -140,6 +147,7 @@ def _run_readout(args):
         seq_cycle=args.seq_cycles,
         channels=args.channels,
         detection_method=args.detection_method,
+        spotiflow_normalization=args.spotiflow_normalization,
     )
 
 
@@ -157,8 +165,8 @@ def _build_gene_calling(sub):
             "readout/mapping_qc_<method>.png.\n\n"
             "Default method is 'postcode' (requires the vendored postcode package + torch + pyro). "
             "Alternatives documented in sprintseq/cli/gene_calling.py include 'threshold' "
-            "(classical Hamming<=1 match) and 'intensity_direct' / 'per_round_max' "
-            "(starfish-style similarity)."
+            "(classical Hamming<=1 match) and 'intensity_direct' "
+            "(starfish MetricDistance-style similarity)."
         ),
         epilog="Example: sprintseq gene-calling --run-id 20260420_... --ref-file codebook/ZCH_TNBC_marker_genes.csv",
         formatter_class=argparse.RawDescriptionHelpFormatter,

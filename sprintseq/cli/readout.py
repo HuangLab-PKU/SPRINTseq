@@ -34,6 +34,7 @@ from sprintseq.readout import (
 )
 from sprintseq.readout.deduplicate import deduplicate_dataframe
 from sprintseq.readout.mosaic import has_mosaic, mosaic_shape, open_mosaic
+from sprintseq.readout.spot_detection import mosaic_percentiles
 
 # Logging
 _LOG_FMT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -64,6 +65,13 @@ DETECTION_METHOD = 'spotiflow'
 # pipeline's Spotiflow config.
 SPOTIFLOW_PRETRAINED_NAME = 'hybiss'
 SPOTIFLOW_PROB_THRESH = 0.01
+# How Spotiflow's input is scaled to [0, 1] before prediction:
+#   'block'  -- Spotiflow's own default: each 2048^2 block by its own p1/p99.8, so a
+#               block's contrast depends on what else is in it.
+#   'global' -- one p1/p99.8 per mosaic (cycle x channel), estimated by
+#               spot_detection.mosaic_percentiles and shared by all its blocks.
+SPOTIFLOW_NORMALIZATIONS = ('block', 'global')
+SPOTIFLOW_NORMALIZATION = 'block'
 
 # Intensity readout — sequencing cycles are consecutive 1..SEQ_CYCLE
 SEQ_CYCLE = 10
@@ -254,6 +262,7 @@ def detect_all_spots(
     n_workers=N_WORKERS,
     coverage_mask=None,
     coverage_downsample=16,
+    spotiflow_normalization=None,
 ):
     """Stage 1: Detect spots across detection cycles/channels from stitched images.
 
@@ -276,6 +285,10 @@ def detect_all_spots(
         (keep = mask[Y//d, X//d]). For multi-cycle co-decoding where cycles span different
         footprints (e.g. VS200 cyc1 brain-only vs cyc2 full-slide); see
         `_filter_coords_by_coverage`. Default None = no gating (standard SBS behavior).
+    spotiflow_normalization : {'block', 'global'} | None
+        Spotiflow input scaling, see `SPOTIFLOW_NORMALIZATION` (the default when None).
+        Ignored by the other detection methods. With 'global', each mosaic's (mi, ma)
+        is logged and returned in ``detection_stats['norm_range']``.
 
     Returns
     -------
@@ -286,6 +299,13 @@ def detect_all_spots(
     by, bx = block_size
     if detection_cycles is None:
         detection_cycles = DETECTION_CYCLES
+    if spotiflow_normalization is None:
+        spotiflow_normalization = SPOTIFLOW_NORMALIZATION
+    if spotiflow_normalization not in SPOTIFLOW_NORMALIZATIONS:
+        raise ValueError(f"spotiflow_normalization={spotiflow_normalization!r}; "
+                         f"expected one of {SPOTIFLOW_NORMALIZATIONS}")
+    global_norm = detection_method == 'spotiflow' and spotiflow_normalization == 'global'
+    norm_ranges = {}
 
     # Count total blocks for progress bar
     n_total_blocks = 0
@@ -306,6 +326,12 @@ def detect_all_spots(
                 detection_kwargs = _default_detection_kwargs(detection_method, channel, snrs)
                 img = _open_stitched(stc_dir, cyc, channel)
                 h, w = img.shape
+                if global_norm:
+                    mi, ma = mosaic_percentiles(img)
+                    norm_ranges[f"cyc_{cyc}_{channel}"] = [mi, ma]
+                    logger.info(f"  cyc_{cyc}_{channel}: global normalization range "
+                                f"[{mi:.1f}, {ma:.1f}]")
+                    detection_kwargs = {**detection_kwargs, 'norm_range': (mi, ma)}
                 for start_y, start_x in block_starts(h, w, block_size, block_overlap):
                     end_y = min(start_y + by, h)
                     end_x = min(start_x + bx, w)
@@ -346,6 +372,8 @@ def detect_all_spots(
     if not results:
         logger.warning("No spots detected in any channel!")
         detection_stats = {"per_channel": {}, "total_raw": 0, "total_after_exact_dedup": 0}
+        if global_norm:
+            detection_stats["norm_range"] = norm_ranges
         return np.empty((0, 2), dtype=np.float64), detection_stats
 
     # Log per-channel counts (before exact-duplicate removal)
@@ -372,6 +400,10 @@ def detect_all_spots(
         "total_raw": len(all_coords),
         "total_after_exact_dedup": len(unique_coords),
     }
+    if detection_method == 'spotiflow':
+        detection_stats["spotiflow_normalization"] = spotiflow_normalization
+    if global_norm:
+        detection_stats["norm_range"] = norm_ranges
 
     if coverage_mask is not None:
         n_before = len(unique_coords)
@@ -508,7 +540,8 @@ def read_all_intensities(
 
 def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
                  channels=None, detection_method=None,
-                 coverage_mask=None, coverage_downsample=16):
+                 coverage_mask=None, coverage_downsample=16,
+                 spotiflow_normalization=None):
     """Main entry point for stitched-image readout pipeline.
 
     Parameters
@@ -530,6 +563,8 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     detection_method : str, optional
         Detection method dispatched in get_spot_coordinates. One of
         DETECTION_METHODS. Defaults to module-level DETECTION_METHOD.
+    spotiflow_normalization : {'block', 'global'}, optional
+        Spotiflow input scaling. Defaults to SPOTIFLOW_NORMALIZATION.
     """
     # Copy list defaults so callers can't mutate the module-level state via
     # the returned reference.
@@ -538,6 +573,8 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     seq_cycle = SEQ_CYCLE if seq_cycle is None else seq_cycle
     channels = list(CHANNELS) if channels is None else list(channels)
     detection_method = DETECTION_METHOD if detection_method is None else detection_method
+    spotiflow_normalization = (SPOTIFLOW_NORMALIZATION if spotiflow_normalization is None
+                               else spotiflow_normalization)
     if detection_method not in DETECTION_METHODS:
         raise ValueError(
             f"Unknown detection_method={detection_method!r}; "
@@ -560,6 +597,9 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     logger.info(f"Stitched dir: {stc_dir}")
     logger.info(f"Output dir: {read_dir}")
     logger.info(f"Detection: {detection_method}, cycles {detection_cycles}, channels {channels}")
+    if detection_method == 'spotiflow':
+        logger.info(f"Spotiflow: {SPOTIFLOW_PRETRAINED_NAME}, prob_thresh={SPOTIFLOW_PROB_THRESH}, "
+                    f"normalization={spotiflow_normalization}")
     logger.info(f"Intensity: tophat (radius={TOPHAT_RADIUS}, search={SEARCH_RADIUS}), "
                 f"cycles 1-{seq_cycle}, channels {channels}")
     logger.info(f"Block size: {BLOCK_SIZE}, overlap: {BLOCK_OVERLAP}")
@@ -581,6 +621,7 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
         n_workers=n_workers,
         coverage_mask=coverage_mask,
         coverage_downsample=coverage_downsample,
+        spotiflow_normalization=spotiflow_normalization,
     )
     if len(unique_coords) == 0:
         logger.warning("No spots detected. Exiting.")
