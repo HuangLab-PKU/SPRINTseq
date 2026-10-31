@@ -159,15 +159,15 @@ def _detect_spots_in_block(args):
 
     Receives block as plain numpy array (not memmap) for cross-process pickling.
     """
-    channel, block, start_y, start_x, method, method_kwargs = args
-    try:
-        coords_local = get_spot_coordinates(block, method=method, min_distance=2, **method_kwargs)
-        if len(coords_local) == 0:
-            return (channel, np.empty((0, 2), dtype=np.float64), None)
-        global_coords = coords_local + np.array([start_y, start_x], dtype=coords_local.dtype)
-        return (channel, global_coords, None)
-    except Exception as e:
-        return (channel, np.empty((0, 2), dtype=np.float64), str(e))
+    channel, block, start_y, start_x, method, method_kwargs = args[:6]
+    region = args[6] if len(args) > 6 else None
+    coords_local = get_spot_coordinates(block, method=method, min_distance=2, **method_kwargs)
+    if len(coords_local) == 0:
+        return (channel, np.empty((0, 2), dtype=np.float64), None)
+    global_coords = coords_local + np.array([start_y, start_x], dtype=coords_local.dtype)
+    if region is not None:
+        global_coords = global_coords[_coords_in_region(global_coords, region)]
+    return (channel, global_coords, None)
 
 
 def _read_intensity_in_block(args):
@@ -178,14 +178,10 @@ def _read_intensity_in_block(args):
     col_name, block, indices, coords_local, tophat_radius, search_radius = args
     if len(indices) == 0:
         return (col_name, np.array([], dtype=np.int64), np.array([], dtype=np.float64), None)
-    try:
-        intensities = read_intensity_tophat(
-            block, coords_local,
-            tophat_radius=tophat_radius, search_radius=search_radius
-        )
-        return (col_name, indices, intensities, None)
-    except Exception as e:
-        return (col_name, indices, np.full(len(indices), np.nan, dtype=np.float64), str(e))
+    intensities = read_intensity_tophat(
+        block, coords_local, tophat_radius=tophat_radius, search_radius=search_radius)
+    return (col_name, indices, intensities, None)
+
 
 
 # ========== Stage Functions ==========
@@ -257,6 +253,26 @@ def _filter_coords_by_coverage(coords, mask, downsample=16):
     return coords[keep], keep
 
 
+def _block_region(mask, full_shape, y, x, height, width):
+    """Small pyramid-mask patch for one detection task; no whole-mask worker copies."""
+    sy, sx = mask.shape[0] / full_shape[0], mask.shape[1] / full_shape[1]
+    y0, x0 = int(np.floor(y * sy)), int(np.floor(x * sx))
+    y1 = min(mask.shape[0], int(np.ceil((y + height) * sy)))
+    x1 = min(mask.shape[1], int(np.ceil((x + width) * sx)))
+    patch = mask[y0:y1, x0:x1]
+    return (patch, y0, x0, sy, sx)
+
+
+def _coords_in_region(coords, region):
+    patch, y0, x0, sy, sx = region
+    iy = np.floor(coords[:, 0] * sy).astype(int) - y0
+    ix = np.floor(coords[:, 1] * sx).astype(int) - x0
+    valid = (iy >= 0) & (iy < patch.shape[0]) & (ix >= 0) & (ix < patch.shape[1])
+    keep = np.zeros(len(coords), bool)
+    keep[valid] = patch[iy[valid], ix[valid]]
+    return keep
+
+
 def detect_all_spots(
     stc_dir,
     channels=CHANNELS,
@@ -269,6 +285,7 @@ def detect_all_spots(
     coverage_mask=None,
     coverage_downsample=16,
     spotiflow_normalization=None,
+    cycle_rois=None,
 ):
     """Stage 1: Detect spots across detection cycles/channels from stitched images.
 
@@ -312,6 +329,7 @@ def detect_all_spots(
                          f"expected one of {SPOTIFLOW_NORMALIZATIONS}")
     global_norm = detection_method == 'spotiflow' and spotiflow_normalization == 'global'
     norm_ranges = {}
+    cycle_rois = {} if cycle_rois is None else cycle_rois
 
     # Count total blocks for progress bar
     n_total_blocks = 0
@@ -321,7 +339,8 @@ def detect_all_spots(
                 logger.warning(f"Stitched mosaic not found: cyc_{cyc}_{channel}, skipping")
                 continue
             h, w = _stitched_shape(stc_dir, cyc, channel)
-            n_total_blocks += len(block_starts(h, w, block_size, block_overlap))
+            n_total_blocks += sum(1 for yy, xx in block_starts(h, w, block_size, block_overlap)
+                                  if cyc not in cycle_rois or _block_region(cycle_rois[cyc], (h,w), yy, xx, min(by,h-yy), min(bx,w-xx))[0].any())
 
     # Lazy iterator: open memmap per image, yield blocks as numpy arrays
     def _detection_task_iter():
@@ -341,8 +360,12 @@ def detect_all_spots(
                 for start_y, start_x in block_starts(h, w, block_size, block_overlap):
                     end_y = min(start_y + by, h)
                     end_x = min(start_x + bx, w)
+                    region = (_block_region(cycle_rois[cyc], (h,w), start_y, start_x,
+                                            end_y-start_y, end_x-start_x) if cyc in cycle_rois else None)
+                    if region is not None and not region[0].any():
+                        continue
                     block = np.asarray(img[start_y:end_y, start_x:end_x])
-                    yield (channel, block, start_y, start_x, detection_method, detection_kwargs)
+                    yield (channel, block, start_y, start_x, detection_method, detection_kwargs, region)
                 del img
 
     # Process with sliding window of n_workers tasks
@@ -365,7 +388,7 @@ def detect_all_spots(
                 pbar.update(1)
                 channel, coords, error = future.result()
                 if error:
-                    logger.warning(f"Detection error in block: {error}")
+                    raise RuntimeError(f"HOLD_DETECTION_WORKER_FAILED: {error}")
                 elif len(coords) > 0:
                     results.append((channel, coords))
                 del futures[future]
@@ -523,7 +546,7 @@ def read_all_intensities(
                 pbar.update(1)
                 col_name, indices, intensities, error = future.result()
                 if error:
-                    logger.warning(f"Intensity read error for {col_name}: {error}")
+                    raise RuntimeError(f"HOLD_INTENSITY_WORKER_FAILED {col_name}: {error}")
                 if len(indices) > 0:
                     intensity_df.loc[indices, col_name] = intensities
                 del futures[future]
@@ -533,12 +556,8 @@ def read_all_intensities(
                 break
         pbar.close()
 
-    # Fill any remaining NaN with 0
-    for col in col_names:
-        if intensity_df[col].isna().any():
-            n_miss = intensity_df[col].isna().sum()
-            logger.warning(f"  {col}: {n_miss} spots had no intensity (fill with 0)")
-            intensity_df[col] = intensity_df[col].fillna(0)
+    from sprintseq.observation_checks.preflight import require_finite
+    require_finite(intensity_df, col_names)
 
     logger.info(f"Intensity reading completed for {len(intensity_df)} spots")
     return intensity_df
@@ -547,7 +566,7 @@ def read_all_intensities(
 def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
                  channels=None, detection_method=None,
                  coverage_mask=None, coverage_downsample=16,
-                 spotiflow_normalization=None):
+                 spotiflow_normalization=None, ref_file=None, base_dir=None):
     """Main entry point for stitched-image readout pipeline.
 
     Parameters
@@ -587,13 +606,24 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
             f"expected one of {DETECTION_METHODS}"
         )
 
-    dest_dir = Path(BASE_DEST_DIRECTORY) / f'{run_id}_processed'
+    dest_dir = Path(base_dir or BASE_DEST_DIRECTORY) / f'{run_id}_processed'
     stc_dir = dest_dir / 'stitched'
     read_dir = dest_dir / 'readout'
 
     if not stc_dir.exists():
         raise FileNotFoundError(f"Stitched directory not found: {stc_dir}")
 
+    from sprintseq.observation_checks.preflight import run as observation_preflight, ObservationHold
+    if (dest_dir/'observation_repair/default_activation.json').exists():
+        raise ObservationHold('HOLD_ACTIVE_DEFAULT: use a versioned repair/recovery; standard readout cannot overwrite accepted results')
+    if (read_dir/'position.csv').exists() or (read_dir/'intensity.csv').exists():
+        raise ObservationHold('HOLD_EXISTING_READOUT: resume source-validated workflow checkpoints or use versioned recovery')
+    observation_plan = observation_preflight(dest_dir, ref_file, detection_cycles, seq_cycle, channels)
+    detection_cycles = observation_plan['plan']['effective_cycles']
+    cycle_rois = {}
+    if observation_plan.get('roi_path'):
+        with np.load(observation_plan['roi_path']) as masks:
+            cycle_rois = {int(name.split('_')[1]): masks[name] for name in masks.files}
     read_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("=" * 80)
@@ -628,6 +658,7 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
         coverage_mask=coverage_mask,
         coverage_downsample=coverage_downsample,
         spotiflow_normalization=spotiflow_normalization,
+        cycle_rois=cycle_rois,
     )
     if len(unique_coords) == 0:
         logger.warning("No spots detected. Exiting.")
@@ -730,8 +761,8 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
             dedup_stats={"n_before": n_before_dedup, "n_after": n_after_dedup},
         )
         logger.info(f"  readout_qc.json + readout_qc.png saved to {read_dir}")
-    except Exception as e:
-        logger.warning(f"QC generation failed (non-fatal): {e}")
+    except (OSError, ValueError, RuntimeError) as e:
+        raise RuntimeError(f"HOLD_READOUT_QC_FAILED: {e}") from e
 
     logger.info("=" * 80)
     logger.info("Readout pipeline completed successfully!")
@@ -740,6 +771,8 @@ def run_pipeline(run_id, n_workers=None, detection_cycles=None, seq_cycle=None,
     logger.info("Next step: Run gene_calling to classify genes.")
     logger.info("=" * 80)
 
+    from sprintseq.observation_checks.preflight import bind_readout
+    bind_readout(dest_dir, observation_plan)
     return position_df, intensity_output_df
 
 
@@ -762,10 +795,12 @@ def main():
     parser.add_argument('--detection-method', type=str, default=None,
                         choices=list(DETECTION_METHODS),
                         help=f'Spot detection method. Default: {DETECTION_METHOD}')
+    parser.add_argument('--ref-file', type=str, help='Exact codebook for pre-readout detection coverage checks')
+    parser.add_argument('--base-dir', type=str, default=BASE_DEST_DIRECTORY)
     args = parser.parse_args()
 
     # Log to file
-    read_dir = Path(BASE_DEST_DIRECTORY) / f'{args.run_id}_processed' / 'readout'
+    read_dir = Path(args.base_dir) / f'{args.run_id}_processed' / 'readout'
     read_dir.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(read_dir / 'readout.log', encoding='utf-8')
     fh.setFormatter(logging.Formatter(_LOG_FMT))
@@ -775,7 +810,7 @@ def main():
                  detection_cycles=args.detection_cycles,
                  seq_cycle=args.seq_cycles,
                  channels=args.channels,
-                 detection_method=args.detection_method)
+                 detection_method=args.detection_method, ref_file=args.ref_file, base_dir=args.base_dir)
 
 
 if __name__ == "__main__":
