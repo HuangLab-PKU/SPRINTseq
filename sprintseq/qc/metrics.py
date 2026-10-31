@@ -107,13 +107,20 @@ def compute_gene_calling_metrics(result_df: pd.DataFrame) -> dict:
 
     prob = result_df["Probability"].to_numpy(dtype=np.float64)
     entropy = result_df["Entropy"].to_numpy(dtype=np.float64)
+    raw_prob = prob.copy()
     prob = np.nan_to_num(prob, nan=0.0)
     entropy = np.nan_to_num(entropy, nan=0.0)
     q = compute_phred_qscore(prob)
 
-    margin = np.zeros(total)
+    margin = np.full(total, np.nan)
     if "Probability_2" in result_df.columns:
-        margin = prob - result_df["Probability_2"].to_numpy(dtype=np.float64)
+        second = result_df["Probability_2"].to_numpy(dtype=np.float64)
+        valid_pairs = np.isfinite(raw_prob) & np.isfinite(second)
+        margin[valid_pairs] = raw_prob[valid_pairs] - second[valid_pairs]
+    finite_margin = margin[np.isfinite(margin)]
+    valid_gene = gene_mask.to_numpy() & np.isfinite(raw_prob)
+    valid_gene &= ~gene_col.fillna("").str.startswith("DECOY_").to_numpy()
+    gene_q = compute_phred_qscore(raw_prob[valid_gene])
 
     # Per-gene stats (genes only, not bkg/inf)
     per_gene = []
@@ -121,11 +128,13 @@ def compute_gene_calling_metrics(result_df: pd.DataFrame) -> dict:
         gene_df = result_df[gene_mask]
         for gene_name, grp in gene_df.groupby("Gene"):
             grp_prob = grp["Probability"].to_numpy(dtype=np.float64)
+            finite_prob = grp_prob[np.isfinite(grp_prob)]
             per_gene.append({
                 "gene": str(gene_name),
                 "count": len(grp),
-                "mean_prob": float(np.mean(grp_prob)),
-                "mean_q": float(np.mean(compute_phred_qscore(grp_prob))),
+                "mean_prob": float(np.mean(finite_prob)) if len(finite_prob) else None,
+                "n_valid_prob": len(finite_prob),
+                "mean_q": float(np.mean(compute_phred_qscore(finite_prob))) if len(finite_prob) else None,
             })
         per_gene.sort(key=lambda g: g["count"], reverse=True)
 
@@ -149,13 +158,21 @@ def compute_gene_calling_metrics(result_df: pd.DataFrame) -> dict:
         "q_score": {
             "mean": float(np.mean(q)),
             "median": float(np.median(q)),
-            "fraction_q20": float(np.mean(q >= 20.0)),
-            "fraction_q30": float(np.mean(q >= 30.0)),
+            "fraction_q20": float(np.mean(prob >= 0.99)),
+            "fraction_q30": float(np.mean(prob >= 0.999)),
         },
         "confidence_margin": {
-            "mean": float(np.mean(margin)),
-            "median": float(np.median(margin)),
+            "mean": float(np.mean(finite_margin)) if len(finite_margin) else None,
+            "median": float(np.median(finite_margin)) if len(finite_margin) else None,
+            "n_valid": len(finite_margin),
+            "n_invalid": total - len(finite_margin),
         },
+        "q_score_gene": {
+            "n_spots": int(valid_gene.sum()),
+            "n_q20": int(np.sum(raw_prob[valid_gene] >= 0.99)),
+            "fraction_q20": float(np.mean(raw_prob[valid_gene] >= 0.99)) if len(gene_q) else None,
+        },
+        "invalid_probability_count": int(np.sum(~np.isfinite(raw_prob))),
         "per_gene_stats": per_gene,
     }
     return metrics
@@ -193,7 +210,7 @@ def compute_alert_flags(metrics: dict) -> list:
         })
 
     cm = metrics.get("confidence_margin", {}).get("mean", 1.0)
-    if cm < 0.10:
+    if cm is not None and np.isfinite(cm) and cm < 0.10:
         flags.append({
             "level": "warning",
             "metric": "confidence_margin_mean",
