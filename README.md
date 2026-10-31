@@ -80,3 +80,30 @@ from sprintseq.gene_calling import map_genes, correct_intensity, check_sequence
 ```
 
 Heavy optional deps are lazy-imported: calling `get_spot_coordinates(..., method='spotiflow')` or `map_genes(..., method='postcode')` without the corresponding backend installed raises a clear `ImportError` with the install hint.
+
+## Observation failure repair
+
+An opt-in post-readout stage detects local attenuation/defocus, propagates exact missing coverage and compares acquisition histories before rebuilding a versioned molecular dataset. Run `python -m sprintseq.observation_repair.pipeline --help`. See [the observation repair contract](docs/observation_repair.md) for source bindings, uncertainty, missing-tile handling and current-version consumption. Baseline products are preserved.
+
+### Observation-aware repair method
+
+Use `sprintseq observation-repair --help` for the opt-in, source-bound repair stage.
+It handles local optical failure and missing observations, with separate qualification
+of reaction-pause hypotheses. See [the method specification](docs/methods/observation_repair.md)
+and [operational guide](docs/observation_repair.md). Image detection lives in
+`spatial_img_core.observation_qc`; no experiment-package import is required by this stage.
+
+### Standard artifact prevention and acceptance
+
+Read [Standard artifact checks and recovery](docs/methods/artifact_control.md).
+The default readout now requires source/image preflight and codebook-wide detection
+coverage; supplemental rounds are restricted to their source-derived ROIs. Missing
+intensities stop processing instead of being filled with zero. The standard
+PowerShell workflow uses native child exit receipts and an all-panel post-decode
+gate; HOLD results remain provisional. Existing accepted runs use versioned repair
+or local measured recovery, not an ordinary readout overwrite.
+
+
+## Automatic artifact recovery
+
+Use `sprintseq pipeline --run-id <run-id> --ref-file <exact-codebook.csv>` for source-gated processing with automatic missing-observation, optical/reaction-history and supplemental-discovery recovery. C11 availability/alignment failures fall back to measured later sequencing rounds. Existing accepted defaults are verified without replay. See [artifact control](docs/methods/artifact_control.md#standard-automatic-recovery-entry) for supported inputs, residual unknowns and transaction semantics.
