@@ -729,6 +729,26 @@ def intensity_direct_mapping(intensity_df, ref_file, similarity_metric='metric_d
     return result_df
 
 
+def _postcode_e_step_stable(data, w, theta, sigma, n_spots, n_classes,
+                            print_training_progress=False):
+    """Normalize weighted log likelihoods without linear-space underflow."""
+    import torch
+    from torch.distributions import MultivariateNormal
+
+    log_scores = torch.empty((n_spots, n_classes), device=data.device,
+                             dtype=torch.float64)
+    with torch.no_grad():
+        for k in range(n_classes):
+            likelihood = MultivariateNormal(theta[k], sigma).log_prob(data)
+            log_scores[:, k] = likelihood.to(torch.float64) + torch.log(w[k].to(torch.float64))
+        if not torch.isfinite(log_scores).any(dim=1).all():
+            raise RuntimeError("PoSTcode found no finite class likelihood for a spot")
+        probabilities = torch.softmax(log_scores, dim=1)
+    if not torch.isfinite(probabilities).all():
+        raise RuntimeError("PoSTcode posterior probabilities are nonfinite")
+    return probabilities
+
+
 def postcode_mapping(intensity_df, ref_file, cyc_num=10, channels=['cy3', 'cy5'],
                      num_iter=60, batch_size=15000, inference_chunk_size=100000,
                      print_training_progress=True, verbose=True, 
@@ -1068,7 +1088,7 @@ def postcode_mapping(intensity_df, ref_file, cyc_num=10, channels=['cy3', 'cy5']
         
         # 2. Run E-step
         # e_step returns (N_chunk, K_inference) probabilities
-        class_probs_chunk = e_step(chunk_norm, w_star_final, theta_final, sigma_star, 
+        class_probs_chunk = _postcode_e_step_stable(chunk_norm, w_star_final, theta_final, sigma_star,
                                    chunk_norm.shape[0], K_inference, print_training_progress=False)
         
         # 3. Handle Special Classes (Logic from decoding_function)
@@ -1155,7 +1175,7 @@ def postcode_mapping(intensity_df, ref_file, cyc_num=10, channels=['cy3', 'cy5']
         # Note: If no bkg or inf, dimensions handle it.
         # The output order in PoSTcode is: Genes, Bkg, Inf
         
-        collapsed_probs = torch.cat((probs_genes, probs_bkg, probs_inf), dim=1)
+        collapsed_probs = torch.cat((probs_genes, probs_bkg, probs_inf), dim=1).clamp(0.0, 1.0)
         
         # Handle NaN (lines 229-234)
         # nan_spot_ind = torch.unique((torch.isnan(class_probs_star_s)).nonzero(...) )
