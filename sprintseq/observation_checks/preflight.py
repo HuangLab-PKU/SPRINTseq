@@ -145,6 +145,10 @@ def validate_readout_binding(run,ref_file):
     if digest(receipt)!=binding['preflight_sha256']:raise ObservationHold('HOLD_CHANGED_PREFLIGHT')
     pre=json.loads(receipt.read_text());image=Path(pre['scan']['source_image'])
     if digest(ref_file)!=pre['contract']['codebook_sha256'] or [image.stat().st_size,image.stat().st_mtime_ns]!=pre['contract']['image_identity']:raise ObservationHold('HOLD_CHANGED_CODEBOOK_OR_IMAGE')
+    # A matching preflight JSON does not prove its external inputs are unchanged.
+    for mapping in [pre['contract'].get('registration',{}).get('sources',{}),pre['contract'].get('acquisition',{}).get('sources',{}),pre['contract'].get('source_code',{}),pre['scan'].get('coverage_sources',{})]:
+        for path,h in mapping.items():
+            if not Path(path).is_file() or digest(path)!=h:raise ObservationHold('HOLD_CHANGED_PREFLIGHT_SOURCE: '+str(path))
     for f,h in binding['products'].items():
         if digest(f)!=h:raise ObservationHold('HOLD_CHANGED_READOUT')
     frame=pd.read_csv(run/'readout/intensity.csv');require_finite(frame,[c for c in frame if c.startswith('cyc_')])

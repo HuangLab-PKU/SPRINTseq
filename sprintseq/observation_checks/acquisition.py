@@ -19,6 +19,7 @@ def acquisition_check(run_dir):
     raw=Path(plan['raw_run'])
     if not raw.is_dir():raise ObservationHold('HOLD_RAW_SOURCE_UNAVAILABLE: '+str(raw))
     expected=plan['expected_observations'];seen=set();index={};empty=[]
+    if not expected:raise ObservationHold('HOLD_EMPTY_ACQUISITION_PLAN')
     for cycle in sorted({int(row['cycle']) for row in expected}):
         directory=raw/f'cyc_{cycle}'
         if not directory.is_dir():continue
@@ -33,7 +34,7 @@ def acquisition_check(run_dir):
     missing=[];observed=0
     for row in expected:
         key=(int(row['cycle']),row['channel'],int(row['tile_id']))
-        if not row['z_indices'] or len(set(row['z_indices']))!=len(row['z_indices']) or min(row['z_indices'])<0:raise ObservationHold('HOLD_INVALID_EXPECTED_Z_INDICES')
+        if not row['z_indices'] or len(set(row['z_indices']))!=len(row['z_indices']) or any(type(z) is not int or z<0 for z in row['z_indices']):raise ObservationHold('HOLD_INVALID_EXPECTED_Z_INDICES')
         if key in seen:raise ObservationHold('HOLD_DUPLICATE_ACQUISITION_PLAN')
         seen.add(key);zs=index.get(key,[])
         if not zs:missing.append({'cycle':key[0],'channel':key[1],'tile_id':key[2],'render_tile':row['render_tile'],'reason':'SOURCE_STACK_ABSENT_AFTER_CONFIRMED_COMPLETION'})
