@@ -192,6 +192,16 @@ def plot_gene_calling_qc(
         if total > 0
         else "Gene Calling QC — 0 spots"
     )
+    if total > 0 and "q_score_gene" in metrics:
+        gene_q = metrics["q_score_gene"]
+        valid_gene = ~result_df["Gene"].isin(["Background", "Infeasible"])
+        valid_gene &= result_df["Gene"].notna()
+        valid_gene &= ~result_df["Gene"].fillna("").str.startswith("DECOY_")
+        n_gene_standard = int((valid_gene & (result_df["Probability"] >= p_standard)).sum())
+        title = (f'Gene Calling QC — {total:,} detected spots | '
+                 f'Q{q_standard} genes: {n_gene_standard:,} / {gene_q["n_spots"]:,} valid gene calls')
+    else:
+        title += " (all classes, including Background/Infeasible)"
     fig.suptitle(title, fontsize=13)
 
     # (1) Probability histogram — log y, with Q-score threshold lines
@@ -260,7 +270,7 @@ def plot_gene_calling_qc(
         ax.legend(fontsize=7)
     ax.set_xlabel("Probability threshold")
     ax.set_ylabel("Spots passing (%)")
-    ax.set_title("Cumulative pass rate")
+    ax.set_title("Cumulative pass rate (all classes)")
     ax.grid(True, alpha=0.3)
 
     # (6) Top 20 genes — filtered by Q≥q_standard (P≥0.99)
@@ -292,16 +302,18 @@ def plot_gene_calling_qc(
 
     # (7) Per-gene quality scatter (Xenium signature)
     ax = axes[2, 0]
-    per_gene = metrics.get("per_gene_stats", [])
+    per_gene = [g for g in metrics.get("per_gene_stats", [])
+                if g["mean_prob"] is not None and g["mean_q"] is not None
+                and np.isfinite(g["mean_prob"]) and np.isfinite(g["mean_q"])]
     if per_gene:
-        counts_arr = np.array([g["count"] for g in per_gene])
+        counts_arr = np.array([g.get("n_valid_prob", g["count"]) for g in per_gene])
         mean_prob_arr = np.array([g["mean_prob"] for g in per_gene])
         mean_q_arr = np.array([g["mean_q"] for g in per_gene])
         sc = ax.scatter(
             np.log10(np.clip(counts_arr, 1, None)),
             mean_prob_arr,
             c=mean_q_arr,
-            cmap="RdYlGn",
+            cmap="viridis",
             s=20,
             alpha=0.8,
             vmin=0,
@@ -336,16 +348,19 @@ def plot_gene_calling_qc(
         ax.set_xlim(0, q_cap + 3)
     ax.set_xlabel("Q-score (Phred)")
     ax.set_ylabel("Count")
-    ax.set_title("Q-score distribution")
+    ax.set_title("Q-score distribution (all classes)")
     ax.grid(True, alpha=0.3)
 
     # (9) Confidence margin histogram (P1 - P2) — log y
     ax = axes[2, 2]
     if total > 0 and "Probability_2" in result_df.columns:
-        margin = prob - np.nan_to_num(result_df["Probability_2"].to_numpy(dtype=np.float64), nan=0.0)
+        raw_first = result_df["Probability"].to_numpy(dtype=np.float64)
+        raw_second = result_df["Probability_2"].to_numpy(dtype=np.float64)
+        valid_pairs = np.isfinite(raw_first) & np.isfinite(raw_second)
+        margin = raw_first[valid_pairs] - raw_second[valid_pairs]
         ax.hist(margin, bins=100, color="mediumpurple", edgecolor="none")
         mean_m = metrics.get("confidence_margin", {}).get("mean", np.nan)
-        if np.isfinite(mean_m):
+        if mean_m is not None and np.isfinite(mean_m):
             ax.axvline(mean_m, color="red", linestyle="--", alpha=0.7,
                        label=f"Mean={mean_m:.3f}")
             ax.legend(fontsize=8)

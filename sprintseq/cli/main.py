@@ -7,6 +7,7 @@ Subcommands:
     codebook        Fetch the run's decoding codebook from probe-bank.
     readout         Spot detection + intensity readout from stitched images.
     gene-calling    Intensity correction (optional) + gene mapping.
+    observation-repair  Source-bound image failure detection and molecular repair.
 
 sprintseq stops at decoded spots. Density maps, segmentation, the cell x gene matrix, cell
 maps and spot maps moved to the `spatial-cells` package (same flags): `sprintseq density`
@@ -130,12 +131,14 @@ def _build_readout(sub):
              f"(Spotiflow's default), 'global' = one p1/p99.8 per mosaic shared by all "
              f"its blocks. (default: {readout_mod.SPOTIFLOW_NORMALIZATION!r})",
     )
+    p.add_argument("--ref-file", type=str, help="Exact codebook for mandatory pre-readout coverage planning.")
+    p.add_argument("--base-dir", type=str, default=readout_mod.BASE_DEST_DIRECTORY)
     p.set_defaults(_func=_run_readout)
 
 
 def _run_readout(args):
     # File logging to readout.log in the run's readout dir
-    read_dir = Path(readout_mod.BASE_DEST_DIRECTORY) / f"{args.run_id}_processed" / "readout"
+    read_dir = Path(args.base_dir) / f"{args.run_id}_processed" / "readout"
     read_dir.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(read_dir / "readout.log", encoding="utf-8")
     fh.setFormatter(logging.Formatter(readout_mod._LOG_FMT))
@@ -148,6 +151,7 @@ def _run_readout(args):
         channels=args.channels,
         detection_method=args.detection_method,
         spotiflow_normalization=args.spotiflow_normalization,
+        ref_file=args.ref_file, base_dir=args.base_dir,
     )
 
 
@@ -189,14 +193,32 @@ def _build_gene_calling(sub):
         help=f"Comma-separated SBS channels (matches readout's --channels). "
              f"(default: {','.join(gc_mod.CHANNELS)})",
     )
+    p.add_argument("--base-dir", type=str, default=str(gc_mod.BASE_DIR))
     p.set_defaults(_func=_run_gene_calling)
 
 
 def _run_gene_calling(args):
-    gc_mod.run_pipeline(
-        run_id=args.run_id, ref_file=args.ref_file,
-        seq_cycle=args.seq_cycles, channels=args.channels,
-    )
+    from sprintseq.observation_checks.preflight import validate_readout_binding, ObservationHold
+    from sprintseq.observation_checks.audit import run as artifact_audit
+    run_dir = Path(args.base_dir) / f"{args.run_id}_processed"
+    if (run_dir / "observation_repair/default_activation.json").exists():
+        raise ObservationHold("HOLD_ACTIVE_DEFAULT: decode into a versioned recovery, not accepted default outputs")
+    validate_readout_binding(run_dir, args.ref_file)
+    output = run_dir / "readout/mapping_postcode.csv"
+    before = (output.stat().st_size, output.stat().st_mtime_ns) if output.exists() else None
+    previous_base = gc_mod.BASE_DIR
+    try:
+        gc_mod.BASE_DIR = Path(args.base_dir)
+        gc_mod.run_pipeline(run_id=args.run_id, ref_file=args.ref_file,
+                            seq_cycle=args.seq_cycles, channels=args.channels)
+    finally:
+        gc_mod.BASE_DIR = previous_base
+    if not output.exists() or (output.stat().st_size, output.stat().st_mtime_ns) == before:
+        raise ObservationHold("HOLD_NO_FRESH_DECODE: a failed decoder cannot reuse a stale mapping")
+    result = artifact_audit(run_dir, args.ref_file)
+    if result["status"].startswith("HOLD"):
+        logging.error("%s; provisional decode retained. See observation_checks/post_decode/receipt.json", result["status"])
+        raise SystemExit(2)
 
 
 def main(argv=None):
@@ -230,11 +252,15 @@ def main(argv=None):
             "  spatial-cells cell-map  --run-id <id> --gene-file markers.txt\n"
         ),
     )
-    sub = parser.add_subparsers(dest="command", metavar="{codebook,readout,gene-calling}")
+    sub = parser.add_subparsers(dest="command", metavar="{pipeline,codebook,readout,gene-calling,observation-repair}")
 
+    from sprintseq.cli.pipeline import build_parser as build_pipeline
+    build_pipeline(sub)
     _build_codebook(sub)
     _build_readout(sub)
     _build_gene_calling(sub)
+    from sprintseq.cli.observation_repair import build_parser as build_observation_repair
+    build_observation_repair(sub)
 
     args = parser.parse_args(argv)
 
